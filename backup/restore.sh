@@ -8,6 +8,7 @@ set -eu
 
 SNAP="${1:?usage: restore.sh <snapshot-id|latest>}"
 ENV_FILE="${ENV_FILE:-/opt/hijuepapuscraft/.env}"
+# shellcheck disable=SC1090
 . "$ENV_FILE"
 
 echo ">> restoring snapshot $SNAP into volume mc-data-restore"
