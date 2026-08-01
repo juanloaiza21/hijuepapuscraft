@@ -215,20 +215,41 @@ pub async fn backup_now(ctx: Ctx<'_>) -> Result<(), Error> {
         StartOutcome::Started => {}
     }
     // Poll to completion (max 10 min), then report honestly.
+    let mut consecutive_errors = 0u32;
     for _ in 0..300 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        if let Ok(Some(s)) = d.docker.inspect("mc-backup").await {
-            if !s.running {
-                let logs = d.docker.logs_tail("mc-backup", 5).await.unwrap_or_default();
-                let code = s.exit_code.unwrap_or(-1);
-                let verdict = if code == 0 {
-                    ":white_check_mark: Backup finished"
-                } else {
-                    ":rotating_light: Backup FAILED"
-                };
-                ctx.say(format!("{verdict} (exit {code})\n```\n{logs}\n```"))
-                    .await?;
+        match d.docker.inspect("mc-backup").await {
+            Ok(Some(s)) => {
+                consecutive_errors = 0;
+                if !s.running {
+                    let logs = d.docker.logs_tail("mc-backup", 5).await.unwrap_or_default();
+                    let code = s.exit_code.unwrap_or(-1);
+                    let verdict = if code == 0 {
+                        ":white_check_mark: Backup finished"
+                    } else {
+                        ":rotating_light: Backup FAILED"
+                    };
+                    ctx.say(format!("{verdict} (exit {code})\n```\n{logs}\n```"))
+                        .await?;
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                ctx.say(
+                    "Backup container no longer exists (was it recreated mid-run?), check the host.",
+                )
+                .await?;
                 return Ok(());
+            }
+            Err(_) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= 5 {
+                    ctx.say(
+                        "Lost contact with the Docker API while polling the backup, check the host.",
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
         }
     }

@@ -61,18 +61,30 @@ async fn main() -> anyhow::Result<()> {
         })
         .setup(move |ctx, _ready, framework| {
             Box::pin(async move {
-                poise::builtins::register_in_guild(
-                    ctx,
-                    &framework.options().commands,
-                    guild,
-                )
-                .await?;
+                // Spawn the monitor before registering commands so status
+                // alerting keeps working even if registration below fails.
                 tokio::spawn(monitor::run(
                     ctx.http.clone(),
                     monitor_cfg,
                     monitor_docker,
                     monitor_rcon,
                 ));
+                if let Err(e) = poise::builtins::register_in_guild(
+                    ctx,
+                    &framework.options().commands,
+                    guild,
+                )
+                .await
+                {
+                    // Deliberate: propagating this error would leave
+                    // Framework::user_data() awaiting forever with no
+                    // user_data ever set, so every command hangs while the
+                    // process itself looks alive to systemd. Exiting makes
+                    // the unit's Restart=always relaunch and retry a
+                    // transient Discord failure instead of zombifying.
+                    tracing::error!("slash command registration failed: {e:#}");
+                    std::process::exit(1);
+                }
                 tracing::info!("commands registered, monitor running");
                 Ok(Data { cfg, rcon, docker })
             })
