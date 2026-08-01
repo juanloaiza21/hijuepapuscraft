@@ -1,5 +1,6 @@
 mod config;
 mod docker;
+mod monitor;
 mod parse;
 mod rcon;
 
