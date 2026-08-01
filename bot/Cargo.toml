@@ -1,0 +1,16 @@
+[package]
+name = "hijuepapus-bot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+
+[dependencies]
+poise = "0.6.2"
+mc-query = "2.0.0"
+bollard = "0.21.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1"
