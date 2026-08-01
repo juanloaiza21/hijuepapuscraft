@@ -1,0 +1,22 @@
+[Unit]
+Description=Filtered docker-compat API proxy for the bot
+
+[Container]
+ContainerName=socket-proxy
+Image=lscr.io/linuxserver/socket-proxy:3.4.3-r0-ls90
+Network=mcnet.network
+Volume=/run/podman/podman.sock:/var/run/docker.sock:ro
+# CONTAINERS=1: GET list/inspect/stats/logs. ALLOW_*=1 work with POST=0.
+# EXEC stays 0. Nothing else is reachable.
+Environment=CONTAINERS=1
+Environment=ALLOW_START=1
+Environment=ALLOW_STOP=1
+Environment=ALLOW_RESTARTS=1
+ReadOnly=true
+Tmpfs=/run
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target default.target

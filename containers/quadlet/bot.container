@@ -1,0 +1,18 @@
+[Unit]
+Description=HijuepapusCraft Discord bot
+Wants=socket-proxy.service
+After=socket-proxy.service
+
+[Container]
+ContainerName=bot
+# Image tag is bumped by editing this file (versioned pin).
+Image=ghcr.io/juanloaiza21/hijuepapuscraft-bot:changeme
+Network=mcnet.network
+EnvironmentFile=/opt/hijuepapuscraft/.env
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target default.target

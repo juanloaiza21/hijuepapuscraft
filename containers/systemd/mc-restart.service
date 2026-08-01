@@ -1,0 +1,6 @@
+[Unit]
+Description=Daily server restart with in-game warnings
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hijuepapuscraft/scripts/restart-warn.sh

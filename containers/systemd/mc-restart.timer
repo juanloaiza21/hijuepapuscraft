@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily server restart at 06:00 Bogota
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 America/Bogota
+Persistent=false
+
+[Install]
+WantedBy=timers.target

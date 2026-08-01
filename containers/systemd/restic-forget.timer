@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly restic forget+prune, Sunday 05:30 Bogota
+
+[Timer]
+OnCalendar=Sun *-*-* 05:30:00 America/Bogota
+Persistent=true
+
+[Install]
+WantedBy=timers.target

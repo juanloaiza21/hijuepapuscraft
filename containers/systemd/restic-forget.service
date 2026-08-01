@@ -1,0 +1,7 @@
+[Unit]
+Description=Weekly restic retention prune
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/hijuepapuscraft/.env
+ExecStart=/usr/bin/podman run --rm --env-file /opt/hijuepapuscraft/.env -e MODE=forget ${BACKUP_IMAGE}

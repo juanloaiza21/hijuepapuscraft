@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly world backup at 04:30 Bogota
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 America/Bogota
+Persistent=false
+
+[Install]
+WantedBy=timers.target

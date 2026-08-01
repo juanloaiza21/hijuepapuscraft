@@ -1,0 +1,6 @@
+[Unit]
+Description=Nightly world backup (runs attached so failures are visible)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podman start -a mc-backup

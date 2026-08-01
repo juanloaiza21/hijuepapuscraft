@@ -1,0 +1,13 @@
+[Unit]
+Description=Start Minecraft container at boot
+Wants=network-online.target mcnet-network.service podman.socket
+After=network-online.target mcnet-network.service podman.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Retry: boot can race image/network readiness.
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5; do podman start mc && exit 0; sleep 10; done; exit 1'
+
+[Install]
+WantedBy=multi-user.target
