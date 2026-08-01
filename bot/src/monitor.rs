@@ -88,7 +88,6 @@ impl BackupWatch {
 
 /// 30 s loop. Owns its own damper and watch; sends notifications to the
 /// configured channel. Spawned from main after the Discord client is ready.
-#[allow(dead_code)]
 pub async fn run(
     http: Arc<Http>,
     cfg: Config,
