@@ -27,7 +27,22 @@ fn strip_colors(raw: &str) -> String {
 
 pub fn parse_tps(raw: &str) -> Option<Tps> {
     let clean = strip_colors(raw);
-    let after = clean.split("TPS from last 5s, 10s, 1m, 5m, 15m:").nth(1)?;
+    let mut after = clean.split("TPS from last 5s, 10s, 1m, 5m, 15m:").nth(1)?;
+
+    // Trim leading whitespace
+    after = after.trim_start();
+
+    // Strip leading [⚡] marker if present
+    if after.starts_with("[⚡]") {
+        after = &after[4..]; // "[⚡]" is 4 bytes in UTF-8
+        after = after.trim_start();
+    }
+
+    // Truncate at the next [⚡] marker to bound the search
+    if let Some(pos) = after.find("[⚡]") {
+        after = &after[..pos];
+    }
+
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"(\*?)(\d+(?:\.\d+)?)").unwrap());
     let mut vals = Vec::with_capacity(5);
@@ -96,6 +111,12 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse_tps("Unknown command").is_none());
+    }
+
+    #[test]
+    fn rejects_truncated_tps_values() {
+        let truncated = "[⚡] TPS from last 5s, 10s, 1m, 5m, 15m: [⚡]  20.0, 19.9[⚡] [⚡] Tick durations (min/med/95%ile/max ms) from last 10s, 1m: [⚡]  2.5/3.2/5.1/21.5;  2.4/3.4/6.8/45.2";
+        assert!(parse_tps(truncated).is_none());
     }
 
     #[test]
