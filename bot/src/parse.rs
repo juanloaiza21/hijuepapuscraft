@@ -33,10 +33,8 @@ pub fn parse_tps(raw: &str) -> Option<Tps> {
     after = after.trim_start();
 
     // Strip leading [⚡] marker if present
-    if after.starts_with("[⚡]") {
-        after = &after[4..]; // "[⚡]" is 4 bytes in UTF-8
-        after = after.trim_start();
-    }
+    after = after.strip_prefix("[⚡]").unwrap_or(after);
+    after = after.trim_start();
 
     // Truncate at the next [⚡] marker to bound the search
     if let Some(pos) = after.find("[⚡]") {
