@@ -26,6 +26,11 @@ hash = "069d81cab53c0141459ad4d70bcf3e10f17652f24cc62d3b4a0fc2cd2b700871"
 metafile = true
 
 [[files]]
+file = "mods/jade.pw.toml"
+hash = "56416a27ba870a3e5e7cae3f87c2bd08fa79e942e9f6e9f90bfcb0f0959dbb49"
+metafile = true
+
+[[files]]
 file = "mods/jei.pw.toml"
 hash = "010aa58b388c307825fd104fff5755ef3da0c0e9641769b7c79ad9461e0db571"
 metafile = true
