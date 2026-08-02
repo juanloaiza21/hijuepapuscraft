@@ -143,7 +143,7 @@ EOF
     ln -sf "$u" "/etc/systemd/system/$(basename "$u")"
   done
   systemctl daemon-reload
-  systemctl enable mc.service mc-backup.timer mc-restart.timer \
+  systemctl enable --now mc-backup.timer mc-restart.timer \
     restic-forget.timer restic-check.timer
 
   log "phase 1 done. Next steps (see README first run walkthrough for full detail):"
