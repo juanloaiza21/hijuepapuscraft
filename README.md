@@ -1,6 +1,6 @@
 # HijuepapusCraft
 
-A private, whitelisted Fabric 1.21.1 Minecraft server for a small group of friends, running 24/7 on an Oracle Cloud Always Free ARM instance. A Rust Discord bot handles day to day operations (status, start/stop/restart, whitelist, backups) over RCON and a filtered Docker-compatible API, so nobody needs a terminal for routine tasks. World backups go off-instance to Cloudflare R2 via restic. Every part of the stack (containers, mod pack, bot, backups, host setup) is defined in this repo and reproducible from it.
+A private, whitelisted Fabric 26.2 Minecraft server for a small group of friends, running 24/7 on an Oracle Cloud Always Free ARM instance. A Rust Discord bot handles day to day operations (status, start/stop/restart, whitelist, backups) over RCON and a filtered Docker-compatible API, so nobody needs a terminal for routine tasks. World backups go off-instance to Cloudflare R2 via restic. Every part of the stack (containers, mod pack, bot, backups, host setup) is defined in this repo and reproducible from it. The Matcha Flavoured datapack is baked into the world at creation.
 
 ## Architecture
 
@@ -25,12 +25,12 @@ Container names, network, and volume are fixed: `mc`, `bot`, `socket-proxy`, `mc
 
 | Component | Pin |
 |---|---|
-| Minecraft server image | `docker.io/itzg/minecraft-server:2026.7.2-java21` (arm64 confirmed) |
+| Minecraft server image | `docker.io/itzg/minecraft-server:2026.7.2-java25` (arm64 confirmed) |
 | Socket proxy image | `lscr.io/linuxserver/socket-proxy:3.4.3-r0-ls90` (arm64 confirmed) |
 | Backup image base | `docker.io/alpine:3.22` |
 | rcon-cli | 1.7.6 |
 | Fabric loader | 0.19.3 |
-| Minecraft version | 1.21.1 |
+| Minecraft version | 26.2 |
 | Podman (host) | 4.9.3, Ubuntu noble repo, rootful |
 | poise | 0.6.2 |
 | mc-query | 2.0.0 (replaces the originally proposed `rcon` crate, unmaintained since 2021) |
@@ -45,6 +45,10 @@ Container names, network, and volume are fixed: `mc`, `bot`, `socket-proxy`, `mc
 | Backup image (GHCR) | `ghcr.io/juanloaiza21/hijuepapuscraft-backup`, same pinning convention and same pending status as the bot image. |
 
 Never bump an image tag to `latest`. Bump deliberately by editing the pinned tag in `.env` (and `containers/quadlet/bot.container` for the bot) and recreating the affected container.
+
+### Version history and client compatibility
+
+The server initially ran 1.21.1 for ecosystem maturity. After verifying all eight mods have 26.2 builds, the server migrated to 26.2 to enable the Matcha Flavoured datapack, which provides new biomes, blocks, and structures. Clients connecting to this server must use Minecraft 26.2 with the Fabric loader.
 
 ## Oracle Cloud host
 

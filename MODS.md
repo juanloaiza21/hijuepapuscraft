@@ -74,3 +74,15 @@ git revert <pack-commit-sha>
 git push
 podman restart mc
 ```
+
+## Datapacks
+
+The Matcha Flavoured 1.03 datapack is wired via the `DATAPACKS` environment variable in `containers/mc-recreate.sh`, pointing to the official Modrinth release. The datapack is applied at world creation time.
+
+Datapacks that affect worldgen (including Matcha Flavoured) require a world reset to apply structural changes. Datapacks that affect only existing blocks and recipes can be changed with a server restart and container recreate. When in doubt, reset the world:
+
+```bash
+sudo podman volume rm mc-data
+sudo containers/mc-recreate.sh
+sudo podman start mc
+```
