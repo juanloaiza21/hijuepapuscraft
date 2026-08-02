@@ -19,6 +19,25 @@ podman logs --tail 100 mc
 - `PACKWIZ_URL` unreachable (repo went private, GitHub outage, or the pack file moved). The logs show a failed pack fetch. Confirm `curl https://raw.githubusercontent.com/juanloaiza21/hijuepapuscraft/main/pack/pack.toml` returns content.
 - EULA not accepted: `containers/mc-recreate.sh` sets `EULA=TRUE` unconditionally, so this only happens after a hand-edited container definition. Confirm with `podman inspect mc`.
 
+## Port 25565 dead after reboot
+
+**Symptoms:** the server is up (`mc` is running, healthy, players can join over `podman exec mc rcon-cli list` locally), but external connections fail, and it worked before the last reboot.
+
+**Diagnosis:**
+
+```bash
+iptables -t nat -S | grep -i netavark
+podman inspect -f '{{.NetworkSettings.Networks.mcnet.IPAddress}}' mc
+```
+
+If the DNAT rule's destination IP does not match the IP `podman inspect` just printed, a stale netavark DNAT rule from before the reboot is shadowing the fresh one for the container's current address. This happens if `/etc/iptables/rules.v4` was ever persisted with a plain `netfilter-persistent save`, which captures netavark's live rules for whatever IP the container had at persist time.
+
+**Fix:**
+
+1. Sanity check the persisted rules do not carry a netavark/aardvark rule: `grep -viE 'netavark|aardvark' /etc/iptables/rules.v4` should show the same content as the full file; if it does not, a stale netavark rule is in there.
+2. Re-run the curated persist via bootstrap so `/etc/iptables/rules.v4`/`rules.v6` hold only non-container rules again: `sudo scripts/bootstrap.sh` (phase 1 is idempotent and calls `persist_rules`).
+3. `systemctl restart mc.service` so netavark re-issues the DNAT rule for the container's current IP.
+
 ## OOM
 
 **Symptoms:** the `mc` container exits unexpectedly, the host feels sluggish, or players report lag right before a crash.
@@ -64,12 +83,12 @@ backup/restore.sh <snapshot-id|latest>
 This restores the chosen restic snapshot into a fresh volume, `mc-data-restore`, and prints the swap-in steps. Follow them exactly as printed:
 
 ```bash
-systemctl stop mc.service && podman rm -f mc
+podman rm -f mc mc-backup
 podman volume rm mc-data
 podman volume create mc-data
 podman run --rm -v mc-data-restore:/from:ro -v mc-data:/to docker.io/alpine:3.22 sh -c 'cp -a /from/data/. /to/'
-containers/mc-recreate.sh
-containers/backup-recreate.sh
+/opt/hijuepapuscraft/containers/mc-recreate.sh
+/opt/hijuepapuscraft/containers/backup-recreate.sh
 systemctl start mc.service
 ```
 
@@ -81,17 +100,23 @@ Both recreate scripts have to run at the end. A pre-created container keeps its 
 
 **Fix:**
 
+Follows the same order as the README first run walkthrough; this drill only calls out where a rebuild differs from a from-scratch setup.
+
 1. Launch a new `VM.Standard.A1.Flex` instance (README, Oracle Cloud host section).
-2. Run `sudo scripts/bootstrap.sh` (phase 1), then `tailscale up`, disable key expiry for the node, then `sudo scripts/bootstrap.sh --harden` (phase 2) once Tailscale access is confirmed.
-3. Restore the world from R2: `backup/restore.sh latest` (or a specific snapshot id from `restic snapshots`), following the swap-in steps in the restore drill above.
-4. Repoint the Hostinger `mc` A record to the new reserved IP via the `hostinger` CLI:
+2. Run `sudo SSH_KEY="$(cat ~/.ssh/id_ed25519.pub)" scripts/bootstrap.sh` (phase 1), then `tailscale up`, disable key expiry for the node.
+3. Edit `/opt/hijuepapuscraft/.env` with the real values, then `sudo /opt/hijuepapuscraft/scripts/gen-scoped-env.sh` to regenerate `.env.bot`/`.env.backup`. The restic repository already exists in R2, so skip `restic init`.
+4. `sudo systemctl start mcnet-network.service socket-proxy.service`.
+5. Restore the world from R2: `backup/restore.sh latest` (or a specific snapshot id from `restic snapshots`), following the swap-in steps in the restore drill above. Its last step starts `mc.service`.
+6. Run the Host validation gate checklist (README), then `sudo systemctl start bot.service`.
+7. `sudo scripts/bootstrap.sh --harden` (phase 2) once Tailscale access is confirmed.
+8. Repoint the Hostinger `mc` A record to the new reserved IP via the `hostinger` CLI:
 
    ```bash
    hostinger dns records list hijuepapus.pro
    ```
 
    then update the A record with the CLI's update command or the panel.
-5. Data loss is bounded by the last nightly snapshot (04:30 America/Bogota). Anything played after that snapshot and before the reclaim is gone.
+9. Data loss is bounded by the last nightly snapshot (04:30 America/Bogota). Anything played after that snapshot and before the reclaim is gone.
 
 ## Locked out of SSH
 
@@ -114,7 +139,7 @@ systemctl status bot.service
 podman logs bot
 ```
 
-**Fix:** the server itself is unaffected; `mc` runs independently of `bot`, so players stay online. Restart with `systemctl restart bot.service`. If it crash-loops, check `.env` for a stale `DISCORD_TOKEN` or an unreachable `DOCKER_API_URL`.
+**Fix:** the server itself is unaffected; `mc` runs independently of `bot`, so players stay online. Restart with `systemctl restart bot.service`. If it crash-loops, check `.env` for a stale `DISCORD_TOKEN` or an unreachable `DOCKER_API_URL`. `bot.service` reads the scoped `.env.bot`, not `.env` directly, so after fixing the value in `.env` run `scripts/gen-scoped-env.sh` (auto-generated, not hand-edited) before restarting the service.
 
 ## Cracked player bought the game
 
@@ -139,6 +164,6 @@ podman logs mc-backup
 
 **Fix, common causes:**
 
-- R2 credentials rotated: update `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `RESTIC_REPOSITORY` (if the account changed) in `.env`, then run `containers/backup-recreate.sh` to pick them up. The container freezes its env at creation time, so editing `.env` alone is not enough.
+- R2 credentials rotated: update `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `RESTIC_REPOSITORY` (if the account changed) in `.env`, then run `containers/backup-recreate.sh` to pick them up. The container freezes its env at creation time, so editing `.env` alone is not enough; `backup-recreate.sh` also re-runs `scripts/gen-scoped-env.sh` so `.env.backup` (which the nightly timer, `restic-forget.timer`, and `restic-check.timer` all read) picks up the rotated values too.
 - R2 free tier exceeded: check usage in the Cloudflare dashboard. `restic-forget.timer` prunes old snapshots weekly, but a burst of large snapshots can still exceed the 10 GB free tier before the next prune.
 - RCON password drift after a recreate: if `RCON_PASSWORD` changed in `.env` but `mc-backup` was not recreated afterward, the backup's RCON calls fail. The backup itself still completes as a cold backup, but `save-off`/`save-on` will not run around it. Run `containers/backup-recreate.sh`.

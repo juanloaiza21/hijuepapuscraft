@@ -12,13 +12,18 @@ set -a
 source "$ENV_FILE"
 set +a
 
+ENV_FILE="$ENV_FILE" "$(dirname "$0")/../scripts/gen-scoped-env.sh"
+
 podman rm -f mc 2>/dev/null || true
 podman volume exists mc-data || podman volume create mc-data
+podman network exists mcnet || systemctl start mcnet-network.service
 
+# --stop-timeout 120: the default 10s SIGKILLs a mid-save JVM.
 podman create \
   --name mc \
   --network mcnet \
   --restart=on-failure \
+  --stop-timeout 120 \
   -p 25565:25565 \
   -v mc-data:/data \
   -e EULA=TRUE \

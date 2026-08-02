@@ -8,7 +8,7 @@ ContainerName=bot
 # Image tag is bumped by editing this file (versioned pin).
 Image=ghcr.io/juanloaiza21/hijuepapuscraft-bot:changeme
 Network=mcnet.network
-EnvironmentFile=/opt/hijuepapuscraft/.env
+EnvironmentFile=/opt/hijuepapuscraft/.env.bot
 
 [Service]
 Restart=always

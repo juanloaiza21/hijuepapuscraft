@@ -69,11 +69,7 @@ The reserved public IP and its attachment to the instance are still pending; ins
 3. Create bucket `hijuepapus-backups`.
 4. Create an API token scoped to R2 with **Object Read & Write** permission. See the first pitfall below: Object Read alone is not enough.
 5. Fill in `.env`: `RESTIC_REPOSITORY` (the `s3:https://ACCOUNT_ID.r2.cloudflarestorage.com/hijuepapus-backups` form from `.env.example`, with the real account ID), `RESTIC_PASSWORD`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
-6. Initialize the restic repository once:
-
-```bash
-podman run --rm --env-file /opt/hijuepapuscraft/.env --entrypoint restic $BACKUP_IMAGE init
-```
+6. Initialize the restic repository once: this is step 6 of the first run walkthrough below, not a step to run here, since it needs the scoped `.env.backup` file that only exists after bootstrap has run.
 
 Known pitfalls, both hit live during setup:
 
@@ -103,42 +99,52 @@ The Discord application for this bot already exists, named "Don Quijote del neth
 3. Open the URL, pick the guild, authorize.
 4. With Developer Mode enabled in Discord, copy the guild ID, the ID of the role that should count as admin, and the ID of the channel for status notifications. Put them in `.env` as `DISCORD_GUILD_ID`, `DISCORD_ADMIN_ROLE_ID`, `DISCORD_NOTIFY_CHANNEL_ID`. These IDs live only in `.env`, never in this repo's docs.
 
+## Scoped env files
+
+`.env` is the master file, but no single container reads all of it. `scripts/gen-scoped-env.sh` derives `.env.bot` (what `bot.container` uses) and `.env.backup` (what the backup container and the restic timers use) from it, so a leaked bot container cannot leak R2 or restic credentials it never needed. Both scoped files are auto-generated, not hand-edited: bootstrap runs the script once at first install, and `containers/mc-recreate.sh` / `containers/backup-recreate.sh` re-run it every time they run. After rotating any secret in `.env`, either re-run `scripts/gen-scoped-env.sh` directly or re-run the recreate scripts, before restarting anything that depends on the rotated value.
+
 ## First run walkthrough
 
 Run in order on a fresh host, after the Oracle console, Cloudflare R2, Hostinger DNS, and Discord steps above are done.
 
-1. `sudo scripts/bootstrap.sh` (phase 1). Creates the admin user, hardens SSH, installs podman, cockpit, and tailscale, installs the container and timer units, opens `25565` in iptables.
+1. `sudo SSH_KEY="$(cat ~/.ssh/id_ed25519.pub)" scripts/bootstrap.sh` (phase 1). Without `SSH_KEY` set, and no pre-existing `authorized_keys` for the admin user, bootstrap refuses to harden SSH rather than risk locking the operator out; `ADMIN_USER` (default `papu`) picks the admin username, override it if you want a different one. Creates the admin user, hardens SSH, installs podman, cockpit, and tailscale, installs the container and timer units, opens `25565` in iptables, and writes the scoped `.env.bot`/`.env.backup` files.
 2. `tailscale up` and complete the interactive auth.
 3. In the Tailscale admin console, disable key expiry for this node. Skipping this schedules a lockout once phase 2 restricts SSH to the tailnet.
-4. Edit `/opt/hijuepapuscraft/.env` with the real Discord, RCON, image, and R2 values.
-5. `containers/mc-recreate.sh` then `containers/backup-recreate.sh`, to create the `mc` and `mc-backup` containers from the filled-in `.env`.
-6. `systemctl start mcnet-network.service socket-proxy.service bot.service mc.service`.
-7. After the server's first boot, configure EasyAuth for mixed mode:
+4. Edit `/opt/hijuepapuscraft/.env` with the real Discord, RCON, image, and R2 values, then regenerate the scoped env files: `sudo /opt/hijuepapuscraft/scripts/gen-scoped-env.sh`.
+5. `sudo systemctl start mcnet-network.service socket-proxy.service`. Creates the `mcnet` network now; Quadlet's `[Install]` only takes effect at the next boot, so without this the recreate scripts below have no network to attach to.
+6. Initialize the restic repository, now that `.env.backup` carries the real R2 credentials:
 
    ```bash
-   podman exec -it mc sh
-   # inside the container, edit /data/config/EasyAuth/main.conf:
-   #   premium-auto-login = true
-   #   prevent-offline-players-with-online-usernames = true
+   source /opt/hijuepapuscraft/.env
+   sudo podman run --rm --env-file /opt/hijuepapuscraft/.env.backup --entrypoint restic "$BACKUP_IMAGE" init
    ```
+7. `sudo containers/mc-recreate.sh` then `sudo containers/backup-recreate.sh`, to create the `mc` and `mc-backup` containers from the filled-in `.env`.
+8. `sudo systemctl start mc.service`.
+9. Run the [Host validation gate](#host-validation-gate) checklist below. This confirms the compat API path the bot depends on actually works on this host before wiring the bot into it.
+10. `sudo systemctl start bot.service`.
+11. After the server's first boot, configure EasyAuth for mixed mode:
 
-   Then `podman restart mc`.
-8. Test EasyAuth mixed mode empirically: connect with one premium client and one cracked client, confirm both authenticate correctly. If it misbehaves, the documented fallback is changing `ONLINE_MODE=TRUE` to `ONLINE_MODE=FALSE` in `containers/mc-recreate.sh` (everyone password-auths via EasyAuth, `ONLINE_MODE` is hardcoded there, not read from `.env`), then re-running `containers/mc-recreate.sh`.
-9. Pre-generate the world before inviting friends:
+    ```bash
+    sudo podman exec mc sed -i 's/premium-auto-login.*/premium-auto-login = true/' /data/config/EasyAuth/main.conf
+    sudo podman exec mc sed -i 's/prevent-offline-players-with-online-usernames.*/prevent-offline-players-with-online-usernames = true/' /data/config/EasyAuth/main.conf
+    sudo podman restart mc
+    ```
+12. Test EasyAuth mixed mode empirically: connect with one premium client and one cracked client, confirm both authenticate correctly. If it misbehaves, the documented fallback is changing `ONLINE_MODE=TRUE` to `ONLINE_MODE=FALSE` in `containers/mc-recreate.sh` (everyone password-auths via EasyAuth, `ONLINE_MODE` is hardcoded there, not read from `.env`), then re-running `sudo containers/mc-recreate.sh`.
+13. Pre-generate the world before inviting friends:
 
-   ```bash
-   podman exec mc rcon-cli chunky radius 5000
-   podman exec mc rcon-cli chunky start
-   ```
+    ```bash
+    sudo podman exec mc rcon-cli chunky radius 5000
+    sudo podman exec mc rcon-cli chunky start
+    ```
 
-   Expect hours of high CPU. Check progress with `podman exec mc rcon-cli chunky progress`.
-10. `sudo scripts/bootstrap.sh --harden` (phase 2), once Tailscale SSH access is confirmed and key expiry is disabled.
-11. Reboot the host, then run an external connectivity test from outside the host: `nc -vz mc.hijuepapus.pro 25565`. This step matters because the OCI FORWARD-chain firewall issue only reproduces on a clean boot.
-12. Set up an UptimeRobot TCP monitor against `mc.hijuepapus.pro:25565`. This is liveness only: a TCP accept proves the process is listening, not that the tick loop is alive. Playability monitoring is the bot's job.
+    Expect hours of high CPU. Check progress with `sudo podman exec mc rcon-cli chunky progress`.
+14. `sudo scripts/bootstrap.sh --harden` (phase 2), once Tailscale SSH access is confirmed and key expiry is disabled.
+15. Reboot the host, then run an external connectivity test from outside the host: `nc -vz mc.hijuepapus.pro 25565`. This step matters because the OCI FORWARD-chain firewall issue only reproduces on a clean boot.
+16. Set up an UptimeRobot TCP monitor against `mc.hijuepapus.pro:25565`. This is liveness only: a TCP accept proves the process is listening, not that the tick loop is alive. Playability monitoring is the bot's job.
 
 ## Host validation gate
 
-Run once bootstrap has produced a live host, after phase 1 and before `bot.service` is started for the first time. This confirms the compat API path the bot depends on actually works on this host before wiring the bot into it.
+Run as step 9 of the first run walkthrough above: once bootstrap has produced a live host, after phase 1, and before `bot.service` is started for the first time. This confirms the compat API path the bot depends on actually works on this host before wiring the bot into it.
 
 ```
 [ ] curl through socket-proxy: list, inspect, start, and stop against a scratch container

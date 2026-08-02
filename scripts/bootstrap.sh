@@ -32,13 +32,21 @@ ensure_rule() {
   local chain=$1; shift
   if ! iptables -C "$chain" "$@" 2>/dev/null; then
     local pos
-    pos=$(iptables -L "$chain" --line-numbers | awk '/REJECT/{print $1; exit}')
+    pos=$(iptables -nL "$chain" --line-numbers | awk '/REJECT/{print $1; exit}')
     if [[ -n "$pos" ]]; then
       iptables -I "$chain" "$pos" "$@"
     else
       iptables -A "$chain" "$@"
     fi
   fi
+}
+
+persist_rules() {
+  # netfilter-persistent save would capture netavark's live DNAT rules with
+  # current container IPs; restored at boot they shadow the fresh rules and
+  # kill the published port. Persist only non-container rules.
+  iptables-save | grep -viE 'netavark|aardvark' > /etc/iptables/rules.v4
+  ip6tables-save | grep -viE 'netavark|aardvark' > /etc/iptables/rules.v6 2>/dev/null || true
 }
 
 phase1() {
@@ -89,7 +97,7 @@ EOF
   ensure_rule INPUT -p tcp --dport 25565 -j ACCEPT
   ensure_rule FORWARD -p tcp --dport 25565 -j ACCEPT
   ensure_rule FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  netfilter-persistent save
+  persist_rules
 
   log "cockpit from noble-backports (quadlet-aware cockpit-podman)"
   if ! grep -rq "noble-backports" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
@@ -125,6 +133,7 @@ EOF
     chmod 600 "$REPO_DIR/.env"
     log "EDIT ${REPO_DIR}/.env BEFORE STARTING ANYTHING"
   }
+  ENV_FILE="$REPO_DIR/.env" "$REPO_DIR/scripts/gen-scoped-env.sh"
 
   log "install quadlet and systemd units"
   install -d /etc/containers/systemd
@@ -137,12 +146,14 @@ EOF
   systemctl enable mc.service mc-backup.timer mc-restart.timer \
     restic-forget.timer restic-check.timer
 
-  log "phase 1 done. Next steps:"
+  log "phase 1 done. Next steps (see README first run walkthrough for full detail):"
   log "  1. tailscale up            (interactive auth)"
   log "  2. disable key expiry for this node in the Tailscale admin console"
-  log "  3. edit ${REPO_DIR}/.env"
-  log "  4. run the recreate scripts, start units (see README first run)"
-  log "  5. re-run with --harden once SSH over Tailscale works"
+  log "  3. edit ${REPO_DIR}/.env, then re-run scripts/gen-scoped-env.sh"
+  log "  4. start mcnet-network.service and socket-proxy.service"
+  log "  5. init the restic repo, then run the recreate scripts and start mc.service"
+  log "  6. run the host validation gate, then start bot.service"
+  log "  7. re-run with --harden once SSH over Tailscale works"
 }
 
 phase2() {
@@ -152,13 +163,13 @@ phase2() {
   if iptables -C INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT 2>/dev/null; then
     echo "WARNING: world-open SSH rule STILL PRESENT (rule text drift)." >&2
     echo "Offending rule:" >&2
-    iptables -L INPUT --line-numbers | grep 22 >&2
+    iptables -nL INPUT --line-numbers | grep -w 22 >&2 || true
     echo "Remove manually before trusting this hardening." >&2
   fi
   ensure_rule INPUT -i tailscale0 -p tcp --dport 22 -j ACCEPT
   ensure_rule INPUT -s 100.64.0.0/10 -p tcp --dport 22 -j ACCEPT
   ensure_rule INPUT -i tailscale0 -p tcp --dport 9090 -j ACCEPT
-  netfilter-persistent save
+  persist_rules
   log "hardened. Verify a NEW ssh session over Tailscale before closing this one."
   log "Break-glass if locked out: OCI console serial connection (see RUNBOOK)."
 }

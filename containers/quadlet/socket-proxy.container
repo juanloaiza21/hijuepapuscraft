@@ -1,5 +1,7 @@
 [Unit]
 Description=Filtered docker-compat API proxy for the bot
+Requires=podman.socket
+After=podman.socket
 
 [Container]
 ContainerName=socket-proxy

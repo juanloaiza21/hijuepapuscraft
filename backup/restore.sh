@@ -20,7 +20,7 @@ podman run --rm --env-file "$ENV_FILE" \
   "${BACKUP_IMAGE}" restore "$SNAP" --target /restore
 
 echo ">> restored. To swap it in:"
-echo "   systemctl stop mc.service && podman rm -f mc"
+echo "   podman rm -f mc mc-backup"
 echo "   podman volume rm mc-data"
 echo "   podman volume create mc-data"
 echo "   podman run --rm -v mc-data-restore:/from:ro -v mc-data:/to docker.io/alpine:3.22 sh -c 'cp -a /from/data/. /to/'"

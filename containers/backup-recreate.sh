@@ -12,14 +12,18 @@ set -a
 source "$ENV_FILE"
 set +a
 
+DIR="$(dirname "$ENV_FILE")"
+ENV_FILE="$ENV_FILE" "$(dirname "$0")/../scripts/gen-scoped-env.sh"
+
 podman rm -f mc-backup 2>/dev/null || true
+podman network exists mcnet || systemctl start mcnet-network.service
 
 podman create \
   --name mc-backup \
   --network mcnet \
   --restart=no \
   -v mc-data:/data:ro \
-  --env-file "$ENV_FILE" \
+  --env-file "$DIR/.env.backup" \
   -e MODE=backup \
   -e SNAPSHOT_TAG=scheduled \
   "${BACKUP_IMAGE}"

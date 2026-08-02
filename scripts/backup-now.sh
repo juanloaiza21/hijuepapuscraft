@@ -10,10 +10,12 @@ set -a
 source "$ENV_FILE"
 set +a
 
+DIR="$(dirname "$ENV_FILE")"
+
 exec podman run --rm \
   --network mcnet \
   -v mc-data:/data:ro \
-  --env-file "$ENV_FILE" \
+  --env-file "$DIR/.env.backup" \
   -e MODE=backup \
   -e SNAPSHOT_TAG=pre-change \
   "${BACKUP_IMAGE}"
