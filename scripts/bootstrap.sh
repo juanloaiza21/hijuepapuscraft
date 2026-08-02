@@ -62,6 +62,17 @@ phase1() {
   fi
 
   log "ssh hardening (key-only, no root)"
+  # Guard: prevent SSH lockout if no key is provisioned.
+  if [[ -z "$SSH_KEY" ]] && [[ ! -s "/home/$ADMIN_USER/.ssh/authorized_keys" ]]; then
+    if [[ "${FORCE_SSH_HARDEN:-}" != "1" ]]; then
+      echo "FATAL: SSH_KEY is empty and no authorized_keys for $ADMIN_USER." >&2
+      echo "Hardening sshd now would strand the operator (no remote access after reboot)." >&2
+      echo "Re-run with SSH_KEY set, or pre-provision /home/$ADMIN_USER/.ssh/authorized_keys manually." >&2
+      echo "Note: OCI's ubuntu user SSH key remains active regardless (this drop-in does not remove it)." >&2
+      echo "Override with: FORCE_SSH_HARDEN=1 $0" >&2
+      exit 1
+    fi
+  fi
   install -m 644 /dev/stdin /etc/ssh/sshd_config.d/90-hijuepapus.conf <<'EOF'
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -73,6 +84,12 @@ EOF
   ensure_pkg podman iptables-persistent netfilter-persistent fail2ban \
     unattended-upgrades git curl ca-certificates
   systemctl enable --now podman.socket
+
+  log "firewall phase 1: open 25565 in INPUT and FORWARD, persist"
+  ensure_rule INPUT -p tcp --dport 25565 -j ACCEPT
+  ensure_rule FORWARD -p tcp --dport 25565 -j ACCEPT
+  ensure_rule FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  netfilter-persistent save
 
   log "cockpit from noble-backports (quadlet-aware cockpit-podman)"
   if ! grep -rq "noble-backports" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
@@ -96,7 +113,10 @@ EOF
 
   log "repo at ${REPO_DIR}"
   if [[ -d "$REPO_DIR/.git" ]]; then
-    git -C "$REPO_DIR" pull --ff-only
+    if ! git -C "$REPO_DIR" pull --ff-only; then
+      echo "ERROR: on-host repo clone has diverged (non-fast-forward). Resolve manually and re-run." >&2
+      exit 1
+    fi
   else
     git clone "$REPO_URL" "$REPO_DIR"
   fi
@@ -117,12 +137,6 @@ EOF
   systemctl enable mc.service mc-backup.timer mc-restart.timer \
     restic-forget.timer restic-check.timer
 
-  log "firewall phase 1: open 25565 in INPUT and FORWARD, persist"
-  ensure_rule INPUT -p tcp --dport 25565 -j ACCEPT
-  ensure_rule FORWARD -p tcp --dport 25565 -j ACCEPT
-  ensure_rule FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  netfilter-persistent save
-
   log "phase 1 done. Next steps:"
   log "  1. tailscale up            (interactive auth)"
   log "  2. disable key expiry for this node in the Tailscale admin console"
@@ -135,6 +149,12 @@ phase2() {
   log "firewall phase 2: SSH and Cockpit via Tailscale only"
   # Remove the OCI-seeded world-open SSH rule if present.
   iptables -D INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT 2>/dev/null || true
+  if iptables -C INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT 2>/dev/null; then
+    echo "WARNING: world-open SSH rule STILL PRESENT (rule text drift)." >&2
+    echo "Offending rule:" >&2
+    iptables -L INPUT --line-numbers | grep 22 >&2
+    echo "Remove manually before trusting this hardening." >&2
+  fi
   ensure_rule INPUT -i tailscale0 -p tcp --dport 22 -j ACCEPT
   ensure_rule INPUT -s 100.64.0.0/10 -p tcp --dport 22 -j ACCEPT
   ensure_rule INPUT -i tailscale0 -p tcp --dport 9090 -j ACCEPT
