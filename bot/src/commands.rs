@@ -29,7 +29,7 @@ async fn is_admin(ctx: Ctx<'_>) -> Result<bool, Error> {
     if !ok {
         ctx.send(
             poise::CreateReply::default()
-                .content("You need the admin role for that.")
+                .content("Alto ahí. Solo los caballeros de la orden de El quijote pueden blandir tal comando.")
                 .ephemeral(true),
         )
         .await?;
@@ -37,7 +37,7 @@ async fn is_admin(ctx: Ctx<'_>) -> Result<bool, Error> {
     Ok(ok)
 }
 
-/// Server status: players, TPS, uptime, memory.
+/// Da cuenta del estado de la ínsula: hidalgos presentes, TPS, tiempo en pie y memoria.
 #[poise::command(slash_command)]
 pub async fn status(ctx: Ctx<'_>) -> Result<(), Error> {
     ctx.defer().await?;
@@ -46,7 +46,7 @@ pub async fn status(ctx: Ctx<'_>) -> Result<(), Error> {
     let running = mc.as_ref().map(|s| s.running).unwrap_or(false);
     if !running {
         ctx.say(format!(
-            ":red_circle: **{}** is offline.",
+            "Yace dormida la ínsula de **{}**, vuestra merced. Ni un alma en sus dominios.",
             d.cfg.server_address
         ))
         .await?;
@@ -63,13 +63,13 @@ pub async fn status(ctx: Ctx<'_>) -> Result<(), Error> {
     let mut out = format!(":green_circle: **{}**\n", d.cfg.server_address);
     match players {
         Some(p) => {
-            out += &format!("Players: {}/{}", p.online, p.max);
+            out += &format!("Hidalgos presentes: {}/{}", p.online, p.max);
             if !p.names.is_empty() {
                 out += &format!(" ({})", p.names.join(", "));
             }
             out += "\n";
         }
-        None => out += "Players: RCON not answering yet\n",
+        None => out += "Hidalgos presentes: el RCON aún no responde, paciencia vuestra merced\n",
     }
     if let Some(t) = tps {
         out += &format!(
@@ -77,18 +77,18 @@ pub async fn status(ctx: Ctx<'_>) -> Result<(), Error> {
             t.last_1m,
             t.last_5m,
             t.last_15m,
-            if t.catching_up { " (catching up)" } else { "" }
+            if t.catching_up { " (recobrando el resuello)" } else { "" }
         );
     }
     if let Some((used, limit)) = mem {
         out += &format!(
-            "Memory: {:.1} / {:.1} GiB\n",
+            "Memoria (bálsamo de Fierabrás consumido): {:.1} / {:.1} GiB\n",
             used as f64 / 1e9 * 0.931,
             limit as f64 / 1e9 * 0.931
         );
     }
     if let Some(st) = mc.and_then(|s| s.started_at) {
-        out += &format!("Container started: {st}\n");
+        out += &format!("En pie desde: {st}\n");
     }
     ctx.say(out).await?;
     Ok(())
@@ -101,8 +101,12 @@ pub async fn start(ctx: Ctx<'_>) -> Result<(), Error> {
     }
     ctx.defer().await?;
     match ctx.data().docker.start("mc").await? {
-        StartOutcome::Started => ctx.say("Starting the server.").await?,
-        StartOutcome::AlreadyRunning => ctx.say("Already running.").await?,
+        StartOutcome::Started => {
+            ctx.say("¡Ensillad a Rocinante! La ínsula despierta de su letargo.").await?
+        }
+        StartOutcome::AlreadyRunning => {
+            ctx.say("Ya galopa la ínsula, vuestra merced; no ha menester espuelas.").await?
+        }
     };
     Ok(())
 }
@@ -114,7 +118,7 @@ pub async fn stop(ctx: Ctx<'_>) -> Result<(), Error> {
     }
     ctx.defer().await?;
     ctx.data().docker.stop("mc").await?;
-    ctx.say("Server stopped. It stays stopped until /start.").await?;
+    ctx.say("La ínsula reposa por mandato vuestro. Dormirá hasta que un /start la despierte.").await?;
     Ok(())
 }
 
@@ -125,15 +129,15 @@ pub async fn restart(ctx: Ctx<'_>) -> Result<(), Error> {
     }
     ctx.defer().await?;
     ctx.data().docker.restart("mc").await?;
-    ctx.say("Restarting.").await?;
+    ctx.say("Recomienza la justa: la ínsula se reinicia.").await?;
     Ok(())
 }
 
-/// Relay a message to in-game chat.
+/// Envía un pregón vuestro al chat de la ínsula.
 #[poise::command(slash_command)]
 pub async fn say(
     ctx: Ctx<'_>,
-    #[description = "Message"] message: String,
+    #[description = "El pregón a voces"] message: String,
 ) -> Result<(), Error> {
     ctx.defer().await?;
     match ctx
@@ -144,8 +148,10 @@ pub async fn say(
         .cmd(&format!("say {message}"))
         .await
     {
-        Ok(_) => ctx.say(format!("Sent: {message}")).await?,
-        Err(_) => ctx.say("Server is offline, nothing sent.").await?,
+        Ok(_) => ctx.say(format!("Pregonado a los cuatro vientos: {message}")).await?,
+        Err(_) => {
+            ctx.say("Duerme la ínsula; vuestro pregón se pierde en el silencio.").await?
+        }
     };
     Ok(())
 }
@@ -158,7 +164,7 @@ pub async fn whitelist(_ctx: Ctx<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, rename = "add")]
 pub async fn wl_add(
     ctx: Ctx<'_>,
-    #[description = "Minecraft username"] name: String,
+    #[description = "El nombre del futuro caballero de Minecraft"] name: String,
 ) -> Result<(), Error> {
     if !is_admin(ctx).await? {
         return Ok(());
@@ -170,7 +176,7 @@ pub async fn wl_add(
 #[poise::command(slash_command, rename = "remove")]
 pub async fn wl_remove(
     ctx: Ctx<'_>,
-    #[description = "Minecraft username"] name: String,
+    #[description = "El nombre del escudero a desterrar de la ínsula"] name: String,
 ) -> Result<(), Error> {
     if !is_admin(ctx).await? {
         return Ok(());
@@ -187,9 +193,17 @@ pub async fn wl_list(ctx: Ctx<'_>) -> Result<(), Error> {
 
 async fn whitelist_cmd(ctx: Ctx<'_>, cmd: &str) -> Result<(), Error> {
     match ctx.data().rcon.lock().await.cmd(cmd).await {
-        Ok(out) => ctx.say(if out.is_empty() { "Done.".into() } else { out }).await?,
+        Ok(out) => {
+            ctx.say(if out.is_empty() {
+                "Hecho está, vuestra merced.".into()
+            } else {
+                out
+            })
+            .await?
+        }
         Err(_) => {
-            ctx.say("Server is offline; whitelist changes need it up.").await?
+            ctx.say("Duerme la ínsula; para tocar el padrón de caballeros ha de estar despierta.")
+                .await?
         }
     };
     Ok(())
@@ -209,7 +223,8 @@ pub async fn backup_now(ctx: Ctx<'_>) -> Result<(), Error> {
     let d = ctx.data();
     match d.docker.start("mc-backup").await? {
         StartOutcome::AlreadyRunning => {
-            ctx.say("A backup is already running.").await?;
+            ctx.say("Ya se labra un respaldo, vuestra merced; no hay dos encomiendas a la vez.")
+                .await?;
             return Ok(());
         }
         StartOutcome::Started => {}
@@ -225,18 +240,18 @@ pub async fn backup_now(ctx: Ctx<'_>) -> Result<(), Error> {
                     let logs = d.docker.logs_tail("mc-backup", 5).await.unwrap_or_default();
                     let code = s.exit_code.unwrap_or(-1);
                     let verdict = if code == 0 {
-                        ":white_check_mark: Backup finished"
+                        ":white_check_mark: La encomienda de respaldo se ha cumplido con honor"
                     } else {
-                        ":rotating_light: Backup FAILED"
+                        ":rotating_light: ¡La encomienda de respaldo ha FRACASADO!"
                     };
-                    ctx.say(format!("{verdict} (exit {code})\n```\n{logs}\n```"))
+                    ctx.say(format!("{verdict} (código de salida {code})\n```\n{logs}\n```"))
                         .await?;
                     return Ok(());
                 }
             }
             Ok(None) => {
                 ctx.say(
-                    "Backup container no longer exists (was it recreated mid-run?), check the host.",
+                    "El contenedor del respaldo se ha desvanecido como castillo encantado (¿fue recreado a mitad de faena?); acuda vuestra merced al castillo (host).",
                 )
                 .await?;
                 return Ok(());
@@ -245,7 +260,7 @@ pub async fn backup_now(ctx: Ctx<'_>) -> Result<(), Error> {
                 consecutive_errors += 1;
                 if consecutive_errors >= 5 {
                     ctx.say(
-                        "Lost contact with the Docker API while polling the backup, check the host.",
+                        "Se ha perdido el contacto con la API de Docker mientras vigilaba el respaldo; acuda vuestra merced al castillo (host).",
                     )
                     .await?;
                     return Ok(());
@@ -253,6 +268,6 @@ pub async fn backup_now(ctx: Ctx<'_>) -> Result<(), Error> {
             }
         }
     }
-    ctx.say("Backup still running after 10 minutes, check the host.").await?;
+    ctx.say("El respaldo aún se afana tras diez minutos; acuda vuestra merced al castillo (host) a inquirir.").await?;
     Ok(())
 }

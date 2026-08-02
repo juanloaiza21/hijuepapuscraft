@@ -110,10 +110,10 @@ pub async fn run(
         );
         if let Some(t) = damper.observe(state) {
             let msg = match t {
-                ServerState::Up => ":green_circle: Server is up",
-                ServerState::Starting => ":yellow_circle: Server is starting",
-                ServerState::Unhealthy => ":orange_circle: Server is unhealthy (tick loop struggling), consider /restart",
-                ServerState::Down => ":red_circle: Server is DOWN",
+                ServerState::Up => ":green_circle: ¡En pie está la ínsula! Presta para recibir a sus caballeros.",
+                ServerState::Starting => ":yellow_circle: La ínsula despereza sus engranajes; aguarde vuestra merced, que ya despierta.",
+                ServerState::Unhealthy => ":orange_circle: La ínsula sufre de melancolía en sus engranajes (el tick loop flaquea). Considere vuestra merced un /restart.",
+                ServerState::Down => ":red_circle: ¡Ha caído la ínsula! Los follones y malandrines han triunfado... por ahora.",
             };
             let _ = channel.say(&http, msg).await;
         }
@@ -122,7 +122,10 @@ pub async fn run(
             match backups.observe(b.running, b.exit_code) {
                 Some(BackupEvent::Failed(c)) => {
                     let _ = channel
-                        .say(&http, format!(":rotating_light: Backup FAILED with exit code {c}"))
+                        .say(
+                            &http,
+                            format!(":rotating_light: ¡La encomienda de respaldo ha FRACASADO con código {c}! Acuda vuestra merced presto."),
+                        )
                         .await;
                 }
                 Some(BackupEvent::Succeeded) => {
