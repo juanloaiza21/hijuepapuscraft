@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths: ['bot/**', 'backup/**', '.github/workflows/images.yml']
+  workflow_dispatch:
 
 permissions:
   contents: read
