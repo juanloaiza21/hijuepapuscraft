@@ -100,6 +100,8 @@ jobs:
           context: backup
           platforms: ${{ matrix.platform }}
           provenance: false
+          build-args: |
+            TARGETARCH=${{ matrix.arch }}
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/hijuepapuscraft-backup,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=backup-${{ matrix.arch }}
           cache-to: type=gha,scope=backup-${{ matrix.arch }},mode=max
