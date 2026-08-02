@@ -236,16 +236,45 @@ pub async fn wl_list(ctx: Ctx<'_>) -> Result<(), Error> {
     whitelist_cmd(ctx, "whitelist list").await
 }
 
+/// Translates vanilla whitelist RCON responses into the hidalgo's tongue.
+/// The raw server text is matched by its stable English substrings; anything
+/// unrecognized is wrapped rather than echoed bare, so operators still see it.
+fn quixotify_whitelist(raw: &str) -> String {
+    let r = raw.trim();
+    if let Some(name) = r.strip_prefix("Added ").and_then(|s| s.strip_suffix(" to the whitelist")) {
+        return format!(
+            ":crossed_swords: ¡Regocijaos! **{name}** ha sido armado caballero de la ínsula. \
+             Que su pico sea recto y su lana abundante."
+        );
+    }
+    if let Some(name) = r.strip_prefix("Removed ").and_then(|s| s.strip_suffix(" from the whitelist")) {
+        return format!(
+            ":scroll: Con pesar lo proclamo: **{name}** ha sido desterrado del padrón. \
+             Que los molinos le sean leves en su exilio."
+        );
+    }
+    if r.contains("already whitelisted") {
+        return "Sosegaos, vuestra merced: ese caballero ya figura en el padrón desde antaño.".into();
+    }
+    if r.contains("not whitelisted") {
+        return "No hallo a tal caballero en el padrón; nadie puede ser desterrado de donde nunca moró.".into();
+    }
+    if r.contains("does not exist") {
+        return "Por más que escudriño los reinos de Mojang, tal nombre no existe. ¿Errata de vuestra pluma, quizá?".into();
+    }
+    if let Some(rest) = r.split("whitelisted player(s):").nth(1) {
+        let names = rest.trim();
+        return format!(":scroll: **El rollo de los caballeros de la ínsula:** {names}");
+    }
+    if r.contains("no whitelisted players") || r.is_empty() {
+        return "El padrón yace virgen, sin caballero alguno. Triste soledad la de esta ínsula.".into();
+    }
+    format!("Responde la ínsula con palabras que este hidalgo no alcanza a versar: *{r}*")
+}
+
 async fn whitelist_cmd(ctx: Ctx<'_>, cmd: &str) -> Result<(), Error> {
     match ctx.data().rcon.lock().await.cmd(cmd).await {
-        Ok(out) => {
-            ctx.say(if out.is_empty() {
-                "Hecho está, vuestra merced.".into()
-            } else {
-                out
-            })
-            .await?
-        }
+        Ok(out) => ctx.say(quixotify_whitelist(&out)).await?,
         Err(_) => {
             ctx.say("Duerme la ínsula; para tocar el padrón de caballeros ha de estar despierta.")
                 .await?
@@ -315,4 +344,41 @@ pub async fn backup_now(ctx: Ctx<'_>) -> Result<(), Error> {
     }
     ctx.say("El respaldo aún se afana tras diez minutos; acuda vuestra merced al castillo (host) a inquirir.").await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quixotify_whitelist;
+
+    #[test]
+    fn knights_added_players_by_name() {
+        let m = quixotify_whitelist("Added CamRG121 to the whitelist");
+        assert!(m.contains("CamRG121") && m.contains("caballero"));
+    }
+
+    #[test]
+    fn banishes_removed_players_by_name() {
+        let m = quixotify_whitelist("Removed CamRG121 from the whitelist");
+        assert!(m.contains("CamRG121") && m.contains("desterrado"));
+    }
+
+    #[test]
+    fn classifies_the_known_refusals() {
+        assert!(quixotify_whitelist("Player is already whitelisted").contains("antaño"));
+        assert!(quixotify_whitelist("Player is not whitelisted").contains("nunca moró"));
+        assert!(quixotify_whitelist("That player does not exist").contains("Mojang"));
+    }
+
+    #[test]
+    fn renders_the_roll_with_names() {
+        let m = quixotify_whitelist("There are 2 whitelisted player(s): alice, bob");
+        assert!(m.contains("rollo") && m.contains("alice, bob"));
+    }
+
+    #[test]
+    fn empty_roll_and_unknown_responses_stay_informative() {
+        assert!(quixotify_whitelist("There are no whitelisted players").contains("virgen"));
+        let unknown = quixotify_whitelist("Some new server response");
+        assert!(unknown.contains("Some new server response"));
+    }
 }
