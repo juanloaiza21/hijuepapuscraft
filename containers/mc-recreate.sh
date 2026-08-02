@@ -38,6 +38,7 @@ podman create \
   -e ENABLE_RCON=true \
   -e RCON_PASSWORD="${RCON_PASSWORD}" \
   -e ENABLE_AUTOPAUSE=FALSE \
+  -e ENFORCE_SECURE_PROFILE=FALSE \
   -e DIFFICULTY="${DIFFICULTY}" \
   -e PACKWIZ_URL=https://raw.githubusercontent.com/juanloaiza21/hijuepapuscraft/main/pack/pack.toml \
   -e TZ="${TZ}" \
