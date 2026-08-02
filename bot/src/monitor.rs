@@ -1,8 +1,12 @@
+use crate::chronicle::{self, SessionTracker};
 use crate::config::Config;
 use crate::docker::DockerCtl;
+use crate::heraldo::Herald;
+use crate::parse;
 use crate::rcon::McRcon;
 use poise::serenity_prelude::{ChannelId, Http};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,12 +101,15 @@ pub async fn run(
     let channel = ChannelId::new(cfg.notify_channel_id);
     let mut damper = Damper::new(ServerState::Down);
     let mut backups = BackupWatch::default();
+    let mut sessions = SessionTracker::default();
+    let mut herald = Herald::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         tick.tick().await;
 
         let mc = docker.inspect("mc").await.ok().flatten();
-        let rcon_ok = { rcon.lock().await.cmd("list").await.is_ok() };
+        let list_result = { rcon.lock().await.cmd("list").await };
+        let rcon_ok = list_result.is_ok();
         let state = classify(
             mc.as_ref().map(|s| s.running).unwrap_or(false),
             mc.as_ref().and_then(|s| s.health.as_deref()),
@@ -132,6 +139,30 @@ pub async fn run(
                     tracing::info!("backup finished ok");
                 }
                 None => {}
+            }
+        }
+
+        // Session chronicle: feed the RCON player list into the presence
+        // tracker and narrate any milestone hours crossed this tick. An
+        // unparseable or failed `list` reads as nobody present, which is
+        // exactly the one-missed-poll tolerance we want for RCON hiccups.
+        let present = list_result
+            .as_deref()
+            .ok()
+            .and_then(parse::parse_list)
+            .map(|p| p.names)
+            .unwrap_or_default();
+        for ann in sessions.observe(&present, Instant::now()) {
+            let _ = channel.say(&http, chronicle::session_message(&ann.player, ann.hours)).await;
+        }
+
+        // Deeds ledger: tail mc's log for freshly-earned advancements,
+        // challenges and goals and have Don Quijote proclaim them. Herald
+        // dedups internally so tail overlap across ticks never
+        // double-announces.
+        if let Ok(raw_logs) = docker.logs_tail("mc", 100).await {
+            for msg in herald.process(&raw_logs) {
+                let _ = channel.say(&http, msg).await;
             }
         }
     }

@@ -1,6 +1,8 @@
+mod chronicle;
 mod commands;
 mod config;
 mod docker;
+mod heraldo;
 mod monitor;
 mod parse;
 mod rcon;
