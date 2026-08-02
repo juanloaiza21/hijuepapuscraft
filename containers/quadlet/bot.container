@@ -6,7 +6,7 @@ After=socket-proxy.service
 [Container]
 ContainerName=bot
 # Image tag is bumped by editing this file (versioned pin).
-Image=ghcr.io/juanloaiza21/hijuepapuscraft-bot:sha-904a74e
+Image=ghcr.io/juanloaiza21/hijuepapuscraft-bot:sha-f2110c5
 Network=mcnet.network
 EnvironmentFile=/opt/hijuepapuscraft/.env.bot
 
