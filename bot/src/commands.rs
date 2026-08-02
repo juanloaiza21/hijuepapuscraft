@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::docker::{DockerCtl, StartOutcome};
+use crate::fortuna;
 use crate::parse;
 use crate::rcon::McRcon;
 use poise::serenity_prelude::RoleId;
@@ -16,7 +17,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Ctx<'a> = poise::Context<'a, Data, Error>;
 
 pub fn commands() -> Vec<poise::Command<Data, Error>> {
-    vec![status(), start(), stop(), restart(), say(), whitelist(), backup(), help()]
+    vec![status(), start(), stop(), restart(), say(), whitelist(), backup(), fortuna(), help()]
 }
 
 /// El pergamino de los poderes de este caballero.
@@ -32,12 +33,14 @@ pub async fn help(ctx: Ctx<'_>) -> Result<(), Error> {
         "`/help` \u{2014} este pergamino\n\n",
         "*Solo para la orden de El quijote:*\n",
         "`/start` `/stop` `/restart` \u{2014} despertar, dormir o reiniciar la \u{ED}nsula\n",
-        "`/backup now` \u{2014} encomendar los mundos al arca de respaldo\n\n",
+        "`/backup now` \u{2014} encomendar los mundos al arca de respaldo\n",
+        "`/fortuna jugador:<nombre> horas:<n> suerte:<id>` \u{2014} girar a voluntad la Rueda de la Fortuna sobre un caballero\n\n",
         "*Solo para los Lud\u{F3}patas Antisionistas:*\n",
         "`/whitelist remove <nombre>` \u{2014} desterrar a un caballero\n\n",
         "*Y sin que nadie lo mande, este hidalgo proclama:* ca\u{ED}das y resurrecciones ",
-        "de la \u{ED}nsula, fracasos del arca, cr\u{F3}nicas de sesiones largas y las ",
-        "haza\u{F1}as de cada caballero."
+        "de la \u{ED}nsula, fracasos del arca, cr\u{F3}nicas de sesiones largas, las ",
+        "haza\u{F1}as de cada caballero, los giros de la Rueda de la Fortuna y las ",
+        "eleg\u{ED}as de quienes cayeron en el intento."
     ))
     .await?;
     Ok(())
@@ -343,6 +346,80 @@ pub async fn backup_now(ctx: Ctx<'_>) -> Result<(), Error> {
         }
     }
     ctx.say("El respaldo aún se afana tras diez minutos; acuda vuestra merced al castillo (host) a inquirir.").await?;
+    Ok(())
+}
+
+/// Gira la Rueda de la Fortuna sobre un caballero, fuera de su milestone natural.
+#[poise::command(slash_command)]
+pub async fn fortuna(
+    ctx: Ctx<'_>,
+    #[description = "El nombre del hidalgo sobre quien gira la rueda"] jugador: String,
+    #[description = "Horas de sesión a ponderar (0-100); ignoradas si se fuerza `suerte`"]
+    #[min = 0_u32]
+    #[max = 100_u32]
+    horas: u32,
+    #[description = "Fuerza un efecto concreto por su id (p. ej. pan, zombi, veneno, rayo, disco_de_oro)"]
+    suerte: Option<String>,
+) -> Result<(), Error> {
+    if !is_admin(ctx).await? {
+        return Ok(());
+    }
+    ctx.defer().await?;
+
+    if !fortuna::valid_player_name(&jugador) {
+        ctx.say(
+            "Ese nombre no calza con la usanza de los hidalgos de Minecraft (letras, dígitos y guion bajo, hasta 16 caracteres). Rehúso invocar la rueda con tal nombre.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut rng = fortuna::EntropyRolls::new();
+    let spin = match &suerte {
+        Some(effect_id) => match fortuna::spin_forced(&jugador, effect_id, &mut rng) {
+            Some(s) => s,
+            None => {
+                ctx.say(format!(
+                    "No hallo tal suerte en el sino de esta rueda: `{effect_id}` no es un efecto conocido."
+                ))
+                .await?;
+                return Ok(());
+            }
+        },
+        None => fortuna::spin(&jugador, horas, &mut rng),
+    };
+
+    tracing::info!(
+        "/fortuna: {} @ {}h -> {} ({:?})",
+        jugador,
+        horas,
+        spin.effect_id,
+        spin.category
+    );
+
+    let mut any_failed = false;
+    {
+        let mut r = ctx.data().rcon.lock().await;
+        if let Err(e) = r.cmd(&format!("say {}", spin.game_msg)).await {
+            tracing::warn!("fortuna: rcon say failed: {e:#}");
+            any_failed = true;
+        }
+        for cmd in &spin.commands {
+            if let Err(e) = r.cmd(cmd).await {
+                tracing::warn!("fortuna: rcon command {cmd:?} failed: {e:#}");
+                any_failed = true;
+            }
+        }
+    }
+
+    let mut reply = spin.discord_msg.clone();
+    if let Some(effect_id) = &suerte {
+        reply += &format!("\n*(suerte: {effect_id})*");
+    }
+    if any_failed {
+        reply += "\n:warning: Alguna orden de RCON no obtuvo respuesta; quizá la ínsula duerme o anda a medio despertar.";
+    }
+    ctx.say(reply).await?;
     Ok(())
 }
 

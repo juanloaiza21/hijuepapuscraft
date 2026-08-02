@@ -1,6 +1,7 @@
 use crate::chronicle::{self, SessionTracker};
 use crate::config::Config;
 use crate::docker::DockerCtl;
+use crate::fortuna;
 use crate::heraldo::Herald;
 use crate::parse;
 use crate::rcon::McRcon;
@@ -189,6 +190,7 @@ pub async fn run(
     let mut backups = BackupWatch::default();
     let mut sessions = SessionTracker::default();
     let mut herald = Herald::new();
+    let mut fortune_rng = fortuna::EntropyRolls::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         tick.tick().await;
@@ -250,6 +252,33 @@ pub async fn run(
             .unwrap_or_default();
         for ann in sessions.observe(&present, Instant::now()) {
             let _ = channel.say(&http, chronicle::session_message(&ann.player, ann.hours)).await;
+
+            // La Rueda de la Fortuna: spin for this milestone and turn the
+            // result into real RCON consequences. RCON failures here are
+            // logged and swallowed, never propagated — a hiccup spinning
+            // the wheel must never take down the monitor loop.
+            if fortuna::valid_player_name(&ann.player) {
+                let spin = fortuna::spin(&ann.player, ann.hours, &mut fortune_rng);
+                tracing::info!(
+                    "la rueda de la fortuna: {} @ {}h -> {} ({:?})",
+                    ann.player,
+                    ann.hours,
+                    spin.effect_id,
+                    spin.category
+                );
+                {
+                    let mut r = rcon.lock().await;
+                    if let Err(e) = r.cmd(&format!("say {}", spin.game_msg)).await {
+                        tracing::warn!("fortuna: rcon say failed: {e:#}");
+                    }
+                    for cmd in &spin.commands {
+                        if let Err(e) = r.cmd(cmd).await {
+                            tracing::warn!("fortuna: rcon command {cmd:?} failed: {e:#}");
+                        }
+                    }
+                }
+                let _ = channel.say(&http, spin.discord_msg).await;
+            }
         }
 
         // Deeds ledger: tail mc's log for freshly-earned advancements,

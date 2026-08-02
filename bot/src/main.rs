@@ -2,6 +2,7 @@ mod chronicle;
 mod commands;
 mod config;
 mod docker;
+mod fortuna;
 mod heraldo;
 mod monitor;
 mod parse;
