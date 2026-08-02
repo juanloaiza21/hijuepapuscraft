@@ -11,8 +11,18 @@ permissions:
   packages: write
 
 jobs:
-  bot:
-    runs-on: ubuntu-24.04-arm
+  build-bot:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/arm64
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+          - platform: linux/amd64
+            arch: amd64
+            runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -21,23 +31,61 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v6
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/hijuepapuscraft-bot
-          tags: type=sha
       - uses: docker/build-push-action@v7
+        id: build
         with:
           context: bot
-          platforms: linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=bot
-          cache-to: type=gha,scope=bot,mode=max
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/hijuepapuscraft-bot,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=bot-${{ matrix.arch }}
+          cache-to: type=gha,scope=bot-${{ matrix.arch }},mode=max
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: digests-bot-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
-  backup:
-    runs-on: ubuntu-24.04-arm
+  merge-bot:
+    needs: build-bot
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-bot-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository_owner }}/hijuepapuscraft-bot:sha-${GITHUB_SHA::7} \
+            $(printf 'ghcr.io/${{ github.repository_owner }}/hijuepapuscraft-bot@sha256:%s ' *)
+
+  build-backup:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/arm64
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+          - platform: linux/amd64
+            arch: amd64
+            runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -46,17 +94,45 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v6
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/hijuepapuscraft-backup
-          tags: type=sha
       - uses: docker/build-push-action@v7
+        id: build
         with:
           context: backup
-          platforms: linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=backup
-          cache-to: type=gha,scope=backup,mode=max
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/hijuepapuscraft-backup,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=backup-${{ matrix.arch }}
+          cache-to: type=gha,scope=backup-${{ matrix.arch }},mode=max
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: digests-backup-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-backup:
+    needs: build-backup
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-backup-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository_owner }}/hijuepapuscraft-backup:sha-${GITHUB_SHA::7} \
+            $(printf 'ghcr.io/${{ github.repository_owner }}/hijuepapuscraft-backup@sha256:%s ' *)
