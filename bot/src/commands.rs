@@ -16,7 +16,31 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Ctx<'a> = poise::Context<'a, Data, Error>;
 
 pub fn commands() -> Vec<poise::Command<Data, Error>> {
-    vec![status(), start(), stop(), restart(), say(), whitelist(), backup()]
+    vec![status(), start(), stop(), restart(), say(), whitelist(), backup(), help()]
+}
+
+/// El pergamino de los poderes de este caballero.
+#[poise::command(slash_command)]
+pub async fn help(ctx: Ctx<'_>) -> Result<(), Error> {
+    ctx.say(concat!(
+        "**El pergamino de Don Quijote del nether** \u{1F4DC}\n\n",
+        "*Para todo villano o caballero:*\n",
+        "`/status` \u{2014} el estado de la \u{ED}nsula: almas presentes, TPS, memoria\n",
+        "`/whitelist add <nombre>` \u{2014} armar caballero a un nuevo jugador\n",
+        "`/whitelist list` \u{2014} leer el rollo de los caballeros\n",
+        "`/say <mensaje>` \u{2014} hablar al mundo con la voz del servidor\n",
+        "`/help` \u{2014} este pergamino\n\n",
+        "*Solo para la orden de El quijote:*\n",
+        "`/start` `/stop` `/restart` \u{2014} despertar, dormir o reiniciar la \u{ED}nsula\n",
+        "`/backup now` \u{2014} encomendar los mundos al arca de respaldo\n\n",
+        "*Solo para los Lud\u{F3}patas Antisionistas:*\n",
+        "`/whitelist remove <nombre>` \u{2014} desterrar a un caballero\n\n",
+        "*Y sin que nadie lo mande, este hidalgo proclama:* ca\u{ED}das y resurrecciones ",
+        "de la \u{ED}nsula, fracasos del arca, cr\u{F3}nicas de sesiones largas y las ",
+        "haza\u{F1}as de cada caballero."
+    ))
+    .await?;
+    Ok(())
 }
 
 async fn has_role(ctx: Ctx<'_>, role_id: u64) -> bool {
