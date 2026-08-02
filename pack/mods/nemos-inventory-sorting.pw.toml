@@ -1,0 +1,13 @@
+name = "Nemo's Inventory Sorting"
+filename = "nemos-inventory-sorting-Fabric-26.2-1.21.2.jar"
+side = "client"
+
+[download]
+url = "https://cdn.modrinth.com/data/JHgf35QL/versions/7wOWeSaH/nemos-inventory-sorting-Fabric-26.2-1.21.2.jar"
+hash-format = "sha512"
+hash = "08a3f16e8d5fee55690f7fba79650ee958dac554cd5b8657a07b58d4a7440f75deb6c04a8d48c73eb318e68053c39a1b486a200d372d08a260b7706e1d7d31d2"
+
+[update]
+[update.modrinth]
+mod-id = "JHgf35QL"
+version = "7wOWeSaH"
