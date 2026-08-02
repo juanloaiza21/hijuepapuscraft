@@ -30,6 +30,9 @@ podman create \
   -e TYPE=FABRIC \
   -e VERSION=26.2 \
   -e DATAPACKS=https://cdn.modrinth.com/data/QI0EmgZ1/versions/2OaIqKKy/Matcha_Flavoured_1_03.zip \
+  -e RESOURCE_PACK=https://cdn.modrinth.com/data/QI0EmgZ1/versions/2OaIqKKy/Matcha_Flavoured_1_03.zip \
+  -e RESOURCE_PACK_SHA1=4d40b820203b51a91473f74dd961c858889fcdb8 \
+  -e RESOURCE_PACK_ENFORCE=FALSE \
   -e ONLINE_MODE=TRUE \
   -e ENABLE_WHITELIST=TRUE \
   -e ENFORCE_WHITELIST=TRUE \
