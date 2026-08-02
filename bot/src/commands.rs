@@ -189,9 +189,7 @@ pub async fn wl_add(
     ctx: Ctx<'_>,
     #[description = "El nombre del futuro caballero de Minecraft"] name: String,
 ) -> Result<(), Error> {
-    if !is_admin(ctx).await? {
-        return Ok(());
-    }
+    // Knighting is open to every villager; only banishment stays gated.
     ctx.defer().await?;
     whitelist_cmd(ctx, &format!("whitelist add {name}")).await
 }
