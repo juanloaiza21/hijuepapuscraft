@@ -1,3 +1,4 @@
+mod changelog;
 mod chronicle;
 mod commands;
 mod config;
@@ -14,6 +15,58 @@ use poise::serenity_prelude as serenity;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
+
+/// Directory holding the "last announced build" marker file. Overridable
+/// via `BOT_STATE_DIR` (tests use a tempdir); defaults to `/data`, backed
+/// in production by the `bot-state` podman volume (see
+/// `containers/quadlet/bot.container`).
+fn state_dir() -> String {
+    std::env::var("BOT_STATE_DIR").unwrap_or_else(|_| "/data".to_string())
+}
+
+/// Reads the last-announced build sha, and if the currently running build
+/// is new, posts a Quijote-voiced changelog to the notify channel and
+/// persists the new sha so the next restart of *this* build stays quiet.
+///
+/// All file IO failures are logged and swallowed — a hiccup here must
+/// never block or fail startup.
+async fn announce_changelog_if_new(http: &Arc<serenity::Http>, cfg: &Config) {
+    let dir = state_dir();
+    let state_path = std::path::Path::new(&dir).join("last_announced_build");
+    let current_sha = env!("GIT_SHA");
+
+    let last_announced = match std::fs::read_to_string(&state_path) {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!("changelog: failed to read state file {}: {e:#}", state_path.display());
+            None
+        }
+    };
+
+    if !changelog::should_announce(current_sha, last_announced.as_deref()) {
+        tracing::info!("changelog: build {current_sha} already announced, staying quiet");
+        return;
+    }
+
+    let build = changelog::parse_build(current_sha, env!("GIT_LOG"));
+    let msg = changelog::render(&build, last_announced.as_deref());
+    let channel = serenity::ChannelId::new(cfg.notify_channel_id);
+    if let Err(e) = channel.say(http, msg).await {
+        tracing::warn!("changelog: failed to post changelog announcement: {e:#}");
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("changelog: failed to create state dir {dir}: {e:#}");
+    }
+    match std::fs::write(&state_path, current_sha) {
+        Ok(()) => tracing::info!("changelog: announced build {current_sha}"),
+        Err(e) => tracing::warn!(
+            "changelog: failed to persist last announced build to {}: {e:#}",
+            state_path.display()
+        ),
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -90,6 +143,13 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 tracing::info!("commands registered, monitor running");
+
+                // Don Quijote proclaims once per genuinely new build; a
+                // restart of the same build (crash loop, unattended-
+                // upgrade reboot, config reload) stays silent. Never
+                // allowed to block or fail startup.
+                announce_changelog_if_new(&ctx.http, &cfg).await;
+
                 Ok(Data { cfg, rcon, docker })
             })
         })

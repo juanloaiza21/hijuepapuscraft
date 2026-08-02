@@ -9,6 +9,10 @@ ContainerName=bot
 Image=ghcr.io/juanloaiza21/hijuepapuscraft-bot:sha-e5b046d
 Network=mcnet.network
 EnvironmentFile=/opt/hijuepapuscraft/.env.bot
+# Persists the last-announced build sha across restarts (see
+# src/changelog.rs) so only genuinely new builds get a changelog
+# announcement, not every crash-loop or unattended-upgrade reboot.
+Volume=bot-state:/data
 
 [Service]
 Restart=always
