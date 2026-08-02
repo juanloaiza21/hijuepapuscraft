@@ -19,17 +19,40 @@ pub fn commands() -> Vec<poise::Command<Data, Error>> {
     vec![status(), start(), stop(), restart(), say(), whitelist(), backup()]
 }
 
-async fn is_admin(ctx: Ctx<'_>) -> Result<bool, Error> {
-    let role = RoleId::new(ctx.data().cfg.admin_role_id);
-    let ok = ctx
-        .author_member()
+async fn has_role(ctx: Ctx<'_>, role_id: u64) -> bool {
+    let role = RoleId::new(role_id);
+    ctx.author_member()
         .await
         .map(|m| m.roles.contains(&role))
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
+
+async fn is_admin(ctx: Ctx<'_>) -> Result<bool, Error> {
+    let ok = has_role(ctx, ctx.data().cfg.admin_role_id).await;
     if !ok {
         ctx.send(
             poise::CreateReply::default()
                 .content("Alto ahí. Solo los caballeros de la orden de El quijote pueden blandir tal comando.")
+                .ephemeral(true),
+        )
+        .await?;
+    }
+    Ok(ok)
+}
+
+/// Gate for `/whitelist remove`: banishing a knight from the roster is
+/// graver business than the rest of the admin commands, so it answers to
+/// its own role when one is configured, falling back to the ordinary
+/// admin gate otherwise.
+async fn is_remover(ctx: Ctx<'_>) -> Result<bool, Error> {
+    let Some(role_id) = ctx.data().cfg.remover_role_id else {
+        return is_admin(ctx).await;
+    };
+    let ok = has_role(ctx, role_id).await;
+    if !ok {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("Alto ahí. Solo los caballeros de la orden de los Ludópatas Antisionistas tienen licencia para desterrar a un hidalgo de la ínsula.")
                 .ephemeral(true),
         )
         .await?;
@@ -178,7 +201,7 @@ pub async fn wl_remove(
     ctx: Ctx<'_>,
     #[description = "El nombre del escudero a desterrar de la ínsula"] name: String,
 ) -> Result<(), Error> {
-    if !is_admin(ctx).await? {
+    if !is_remover(ctx).await? {
         return Ok(());
     }
     ctx.defer().await?;

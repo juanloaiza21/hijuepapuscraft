@@ -5,6 +5,9 @@ pub struct Config {
     pub discord_token: String,
     pub guild_id: u64,
     pub admin_role_id: u64,
+    /// Role allowed to run `/whitelist remove`. When unset, that command
+    /// falls back to `admin_role_id` like every other admin command.
+    pub remover_role_id: Option<u64>,
     pub notify_channel_id: u64,
     pub docker_api_url: String,
     pub rcon_addr: String,
@@ -22,10 +25,22 @@ impl Config {
         let id = |k: &str| -> anyhow::Result<u64> {
             req(k)?.parse().with_context(|| format!("{k} must be a numeric Discord id"))
         };
+        // Missing or set-but-empty -> None; present and non-numeric is
+        // still a named error, same as the required ids above.
+        let opt_id = |k: &str| -> anyhow::Result<Option<u64>> {
+            match get(k) {
+                None => Ok(None),
+                Some(v) if v.trim().is_empty() => Ok(None),
+                Some(v) => {
+                    v.parse().map(Some).with_context(|| format!("{k} must be a numeric Discord id"))
+                }
+            }
+        };
         Ok(Self {
             discord_token: req("DISCORD_TOKEN")?,
             guild_id: id("DISCORD_GUILD_ID")?,
             admin_role_id: id("DISCORD_ADMIN_ROLE_ID")?,
+            remover_role_id: opt_id("DISCORD_REMOVER_ROLE_ID")?,
             notify_channel_id: id("DISCORD_NOTIFY_CHANNEL_ID")?,
             docker_api_url: get("DOCKER_API_URL").unwrap_or_else(|| "http://socket-proxy:2375".into()),
             rcon_addr: get("RCON_ADDR").unwrap_or_else(|| "mc:25575".into()),
@@ -83,5 +98,46 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.to_string().contains("DISCORD_GUILD_ID"));
+    }
+
+    #[test]
+    fn remover_role_id_is_none_when_absent() {
+        let cfg = Config::from_lookup(env(&[
+            ("DISCORD_TOKEN", "t"),
+            ("DISCORD_GUILD_ID", "123"),
+            ("DISCORD_ADMIN_ROLE_ID", "456"),
+            ("DISCORD_NOTIFY_CHANNEL_ID", "789"),
+            ("RCON_PASSWORD", "pw"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.remover_role_id, None);
+    }
+
+    #[test]
+    fn remover_role_id_parses_when_present() {
+        let cfg = Config::from_lookup(env(&[
+            ("DISCORD_TOKEN", "t"),
+            ("DISCORD_GUILD_ID", "123"),
+            ("DISCORD_ADMIN_ROLE_ID", "456"),
+            ("DISCORD_NOTIFY_CHANNEL_ID", "789"),
+            ("RCON_PASSWORD", "pw"),
+            ("DISCORD_REMOVER_ROLE_ID", "999"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.remover_role_id, Some(999));
+    }
+
+    #[test]
+    fn remover_role_id_bad_value_is_a_named_error() {
+        let err = Config::from_lookup(env(&[
+            ("DISCORD_TOKEN", "t"),
+            ("DISCORD_GUILD_ID", "123"),
+            ("DISCORD_ADMIN_ROLE_ID", "456"),
+            ("DISCORD_NOTIFY_CHANNEL_ID", "789"),
+            ("RCON_PASSWORD", "pw"),
+            ("DISCORD_REMOVER_ROLE_ID", "notanumber"),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("DISCORD_REMOVER_ROLE_ID"));
     }
 }
