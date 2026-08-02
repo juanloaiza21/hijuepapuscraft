@@ -112,11 +112,10 @@ Run in order on a fresh host, after the Oracle console, Cloudflare R2, Hostinger
 3. In the Tailscale admin console, disable key expiry for this node. Skipping this schedules a lockout once phase 2 restricts SSH to the tailnet.
 4. Edit `/opt/hijuepapuscraft/.env` with the real Discord, RCON, image, and R2 values, then regenerate the scoped env files: `sudo /opt/hijuepapuscraft/scripts/gen-scoped-env.sh`.
 5. `sudo systemctl start mcnet-network.service socket-proxy.service`. Creates the `mcnet` network now; Quadlet's `[Install]` only takes effect at the next boot, so without this the recreate scripts below have no network to attach to.
-6. Initialize the restic repository, now that `.env.backup` carries the real R2 credentials:
+6. Initialize the restic repository, now that `.env.backup` carries the real R2 credentials. `.env` is root-owned mode 600, so source it in the same root shell that runs `podman`, not in the operator's own shell:
 
    ```bash
-   source /opt/hijuepapuscraft/.env
-   sudo podman run --rm --env-file /opt/hijuepapuscraft/.env.backup --entrypoint restic "$BACKUP_IMAGE" init
+   sudo sh -c '. /opt/hijuepapuscraft/.env && podman run --rm --env-file /opt/hijuepapuscraft/.env.backup --entrypoint restic "$BACKUP_IMAGE" init'
    ```
 7. `sudo containers/mc-recreate.sh` then `sudo containers/backup-recreate.sh`, to create the `mc` and `mc-backup` containers from the filled-in `.env`.
 8. `sudo systemctl start mc.service`.

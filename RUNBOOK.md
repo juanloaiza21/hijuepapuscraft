@@ -89,7 +89,7 @@ podman volume create mc-data
 podman run --rm -v mc-data-restore:/from:ro -v mc-data:/to docker.io/alpine:3.22 sh -c 'cp -a /from/data/. /to/'
 /opt/hijuepapuscraft/containers/mc-recreate.sh
 /opt/hijuepapuscraft/containers/backup-recreate.sh
-systemctl start mc.service
+systemctl restart mc.service
 ```
 
 Both recreate scripts have to run at the end. A pre-created container keeps its volume reference from creation time, so `mc` and `mc-backup` need to be rebuilt against the restored `mc-data` volume, not just started.
@@ -106,7 +106,7 @@ Follows the same order as the README first run walkthrough; this drill only call
 2. Run `sudo SSH_KEY="$(cat ~/.ssh/id_ed25519.pub)" scripts/bootstrap.sh` (phase 1), then `tailscale up`, disable key expiry for the node.
 3. Edit `/opt/hijuepapuscraft/.env` with the real values, then `sudo /opt/hijuepapuscraft/scripts/gen-scoped-env.sh` to regenerate `.env.bot`/`.env.backup`. The restic repository already exists in R2, so skip `restic init`.
 4. `sudo systemctl start mcnet-network.service socket-proxy.service`.
-5. Restore the world from R2: `backup/restore.sh latest` (or a specific snapshot id from `restic snapshots`), following the swap-in steps in the restore drill above. Its last step starts `mc.service`.
+5. Restore the world from R2: `backup/restore.sh latest` (or a specific snapshot id from `restic snapshots`), following the swap-in steps in the restore drill above. Its last step restarts `mc.service` (`systemctl restart`, not `start`: with `Type=oneshot`/`RemainAfterExit=yes`, `start` on a unit systemd still considers active is a no-op).
 6. Run the Host validation gate checklist (README), then `sudo systemctl start bot.service`.
 7. `sudo scripts/bootstrap.sh --harden` (phase 2) once Tailscale access is confirmed.
 8. Repoint the Hostinger `mc` A record to the new reserved IP via the `hostinger` CLI:
