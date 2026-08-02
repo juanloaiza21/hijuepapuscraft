@@ -28,7 +28,8 @@ podman create \
   -v mc-data:/data \
   -e EULA=TRUE \
   -e TYPE=FABRIC \
-  -e VERSION=1.21.1 \
+  -e VERSION=26.2 \
+  -e DATAPACKS=https://cdn.modrinth.com/data/QI0EmgZ1/versions/2OaIqKKy/Matcha_Flavoured_1_03.zip \
   -e ONLINE_MODE=TRUE \
   -e ENABLE_WHITELIST=TRUE \
   -e ENFORCE_WHITELIST=TRUE \
