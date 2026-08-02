@@ -1,0 +1,144 @@
+# Runbook
+
+Operational drills for HijuepapusCraft. Each section: symptoms, diagnosis, fix.
+
+## Server will not start
+
+**Symptoms:** `mc.service` fails, or `podman ps` shows `mc` restarting or exited; players cannot connect.
+
+**Diagnosis:**
+
+```bash
+systemctl status mc.service
+podman logs --tail 100 mc
+```
+
+**Fix, by cause:**
+
+- Bad `.env` (missing or malformed `MEMORY`, `RCON_PASSWORD`, `DIFFICULTY`, or an image tag). Fix the value in `/opt/hijuepapuscraft/.env`, then `containers/mc-recreate.sh` and `systemctl start mc.service`.
+- `PACKWIZ_URL` unreachable (repo went private, GitHub outage, or the pack file moved). The logs show a failed pack fetch. Confirm `curl https://raw.githubusercontent.com/juanloaiza21/hijuepapuscraft/main/pack/pack.toml` returns content.
+- EULA not accepted: `containers/mc-recreate.sh` sets `EULA=TRUE` unconditionally, so this only happens after a hand-edited container definition. Confirm with `podman inspect mc`.
+
+## OOM
+
+**Symptoms:** the `mc` container exits unexpectedly, the host feels sluggish, or players report lag right before a crash.
+
+**Diagnosis:**
+
+```bash
+podman inspect mc | grep -i oom
+free -h
+```
+
+**Fix:**
+
+- If `OOMKilled` is true, the JVM heap (`MEMORY` in `.env`, currently `6G`) plus host overhead exceeded what the 12 GB instance has free. Lower `MEMORY` in `.env`, then `containers/mc-recreate.sh`.
+- If the OOM lines up with the nightly backup window (04:30 America/Bogota, `mc-backup.timer`), the restic snapshot is competing with the JVM for memory. Check `journalctl -u mc-backup.service` for the timing and consider spacing the backup and restart timers further apart.
+
+## TPS in the floor
+
+**Symptoms:** players report rubber-banding or delayed actions.
+
+**Diagnosis:** Start with `/status` in Discord (players, TPS at 1m/5m/15m, memory). If TPS confirms the problem, profile it:
+
+```bash
+podman exec mc rcon-cli spark profiler start
+# let it run for 60 seconds
+podman exec mc rcon-cli spark profiler stop
+```
+
+Read the URL spark prints on stop; it hosts an interactive flame graph of what is eating the tick.
+
+**Fix:** depends on what the profile shows. Common culprits: too many entities or redstone in one chunk, a mod doing synchronous I/O, or chunk generation load (should be near zero after the Chunky pregen described in the README). There is no generic fix beyond what the profiler points at.
+
+## World corruption and restore drill
+
+**Symptoms:** the server crash-loops on a specific chunk, `mc` logs show corrupted region file errors, or a player reports lost builds beyond normal griefing.
+
+**Fix:** run `backup/restore.sh` with a snapshot id (or `latest`):
+
+```bash
+backup/restore.sh <snapshot-id|latest>
+```
+
+This restores the chosen restic snapshot into a fresh volume, `mc-data-restore`, and prints the swap-in steps. Follow them exactly as printed:
+
+```bash
+systemctl stop mc.service && podman rm -f mc
+podman volume rm mc-data
+podman volume create mc-data
+podman run --rm -v mc-data-restore:/from:ro -v mc-data:/to docker.io/alpine:3.22 sh -c 'cp -a /from/data/. /to/'
+containers/mc-recreate.sh
+containers/backup-recreate.sh
+systemctl start mc.service
+```
+
+Both recreate scripts have to run at the end. A pre-created container keeps its volume reference from creation time, so `mc` and `mc-backup` need to be rebuilt against the restored `mc-data` volume, not just started.
+
+## Oracle reclaimed or killed the instance
+
+**Symptoms:** the instance is unreachable; SSH and the game port are both dead; the OCI console shows the instance terminated or stopped.
+
+**Fix:**
+
+1. Launch a new `VM.Standard.A1.Flex` instance (README, Oracle Cloud host section).
+2. Run `sudo scripts/bootstrap.sh` (phase 1), then `tailscale up`, disable key expiry for the node, then `sudo scripts/bootstrap.sh --harden` (phase 2) once Tailscale access is confirmed.
+3. Restore the world from R2: `backup/restore.sh latest` (or a specific snapshot id from `restic snapshots`), following the swap-in steps in the restore drill above.
+4. Repoint the Hostinger `mc` A record to the new reserved IP via the `hostinger` CLI:
+
+   ```bash
+   hostinger dns records list hijuepapus.pro
+   ```
+
+   then update the A record with the CLI's update command or the panel.
+5. Data loss is bounded by the last nightly snapshot (04:30 America/Bogota). Anything played after that snapshot and before the reclaim is gone.
+
+## Locked out of SSH
+
+**Symptoms:** SSH connection refused or times out, both over the public IP and over Tailscale.
+
+**Fix:**
+
+1. Break-glass access via the OCI console serial connection: Compute > Instance > Console Connection in the OCI console. This does not depend on the network stack at all.
+2. From the serial console, diagnose: `iptables -L` for a bad rule, or `tailscale status` if the tailnet itself is the problem.
+3. Fix iptables directly, or run `tailscale up` again if the node fell off the tailnet (expired key, service restart).
+
+## Bot down
+
+**Symptoms:** slash commands stop responding, no status updates appear in the notify channel.
+
+**Diagnosis:**
+
+```bash
+systemctl status bot.service
+podman logs bot
+```
+
+**Fix:** the server itself is unaffected; `mc` runs independently of `bot`, so players stay online. Restart with `systemctl restart bot.service`. If it crash-loops, check `.env` for a stale `DISCORD_TOKEN` or an unreachable `DOCKER_API_URL`.
+
+## Cracked player bought the game
+
+**Symptoms:** a player who previously joined with a cracked client now has a legitimate Microsoft account; EasyAuth or the whitelist treats them as a brand new player.
+
+**Fix:** their offline-mode UUID changes to their premium UUID. Migrate manually:
+
+1. Get both UUIDs from `usercache.json` in the server's data directory (`/data` inside the `mc` container, next to `server.properties`): the old offline entry, and the new premium entry after they have attempted to join once.
+2. Copy the playerdata file under the world's `playerdata/` directory from the old offline UUID's `.dat` filename to the new premium UUID's filename.
+3. Update the whitelist entry: `/whitelist remove <name>` then `/whitelist add <name>` in Discord, or `podman exec mc rcon-cli whitelist add <name>` directly. EasyWhitelist keeps the whitelist name-based, so this survives the UUID change on its own; the manual step is only the playerdata copy.
+
+## Backup failure alert
+
+**Symptoms:** the bot posts a `Backup FAILED` alert in the notify channel, or `mc-backup.service` shows failed.
+
+**Diagnosis:**
+
+```bash
+journalctl -u mc-backup.service
+podman logs mc-backup
+```
+
+**Fix, common causes:**
+
+- R2 credentials rotated: update `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `RESTIC_REPOSITORY` (if the account changed) in `.env`, then run `containers/backup-recreate.sh` to pick them up. The container freezes its env at creation time, so editing `.env` alone is not enough.
+- R2 free tier exceeded: check usage in the Cloudflare dashboard. `restic-forget.timer` prunes old snapshots weekly, but a burst of large snapshots can still exceed the 10 GB free tier before the next prune.
+- RCON password drift after a recreate: if `RCON_PASSWORD` changed in `.env` but `mc-backup` was not recreated afterward, the backup's RCON calls fail. The backup itself still completes as a cold backup, but `save-off`/`save-on` will not run around it. Run `containers/backup-recreate.sh`.
