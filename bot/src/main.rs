@@ -11,6 +11,7 @@ use commands::Data;
 use config::Config;
 use poise::serenity_prelude as serenity;
 use std::sync::Arc;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 
 #[tokio::main]
@@ -96,6 +97,22 @@ async fn main() -> anyhow::Result<()> {
     let mut client = serenity::ClientBuilder::new(&token, intents)
         .framework(framework)
         .await?;
-    client.start().await?;
+
+    // We're PID1 in the container; podman sends SIGTERM on stop and waits
+    // 10s before SIGKILL. Without a handler the async runtime never sees
+    // the signal, so every restart used to burn the full timeout and exit
+    // 137. Race the client against both signals and exit 0 promptly.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    tokio::select! {
+        result = client.start() => result?,
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM recibido; la ínsula se despide y cierra sus puertas con dignidad.");
+        }
+        _ = sigint.recv() => {
+            tracing::info!("SIGINT recibido; la ínsula se despide y cierra sus puertas con dignidad.");
+        }
+    }
     Ok(())
 }

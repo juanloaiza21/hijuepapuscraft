@@ -240,7 +240,8 @@ pub async fn run(
         // Session chronicle: feed the RCON player list into the presence
         // tracker and narrate any milestone hours crossed this tick. An
         // unparseable or failed `list` reads as nobody present, which is
-        // exactly the one-missed-poll tolerance we want for RCON hiccups.
+        // fine: SessionTracker tolerates absences up to its 5-minute grace
+        // window before ending a session.
         let present = list_result
             .as_deref()
             .ok()

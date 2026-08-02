@@ -8,7 +8,7 @@
 //! [`session_message`].
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Announcement {
@@ -18,13 +18,20 @@ pub struct Announcement {
 
 struct PlayerSession {
     start: Instant,
-    /// Consecutive polls in which this player was absent. Reset to 0 the
-    /// moment they're seen again.
-    missed: u8,
+    /// Wall-clock instant this player was last confirmed present. While
+    /// they're absent this doesn't move; it's compared against `now` to
+    /// decide whether the gap has exceeded the grace window.
+    last_seen: Instant,
     /// Highest full-hour threshold already announced for this session (0
     /// means none yet).
     last_announced_hour: u32,
 }
+
+/// How long a player's session survives a gap in presence (dropped RCON
+/// poll, brief disconnect, quick rejoin) before it's considered over. The
+/// absence itself still counts as elapsed session time once bridged —
+/// that matches how players perceive "I've been playing since 11pm".
+const GRACE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Tracks per-player continuous presence across RCON polls and decides
 /// when a session crosses an hourly milestone worth announcing.
@@ -37,33 +44,28 @@ impl SessionTracker {
     /// Feed the set of currently-online player names for this poll.
     ///
     /// A player missing from `present` doesn't end their session
-    /// immediately: one missed poll is tolerated (a single RCON hiccup
-    /// shouldn't reset everyone's clocks). Two consecutive misses end it.
+    /// immediately: absences up to [`GRACE_WINDOW`] (5 minutes) are
+    /// bridged, and the session keeps its *original* start time — the gap
+    /// counts as elapsed time. An absence longer than that ends the
+    /// session retroactively; a later reappearance starts a brand new one.
     /// Returns one [`Announcement`] per session that just crossed a new
     /// full-hour threshold (>= 2h), never repeating a threshold already
-    /// announced.
+    /// announced, even if the crossing happened during a bridged gap.
     pub fn observe(&mut self, present: &[String], now: Instant) -> Vec<Announcement> {
         for name in present {
             self.sessions
                 .entry(name.clone())
-                .and_modify(|s| s.missed = 0)
-                .or_insert(PlayerSession { start: now, missed: 0, last_announced_hour: 0 });
+                .and_modify(|s| s.last_seen = now)
+                .or_insert(PlayerSession { start: now, last_seen: now, last_announced_hour: 0 });
         }
 
-        let mut ended = Vec::new();
-        for (name, sess) in self.sessions.iter_mut() {
-            if present.iter().any(|p| p == name) {
-                continue;
-            }
-            if sess.missed >= 1 {
-                ended.push(name.clone());
-            } else {
-                sess.missed += 1;
-            }
-        }
-        for name in ended {
-            self.sessions.remove(&name);
-        }
+        // Anyone absent from this poll keeps their session alive only
+        // while within the grace window; past that the session is over
+        // (retroactively, as of whenever they were last seen), and a
+        // later return starts fresh via the `or_insert` above.
+        self.sessions.retain(|name, sess| {
+            present.iter().any(|p| p == name) || now.duration_since(sess.last_seen) <= GRACE_WINDOW
+        });
 
         let mut announcements = Vec::new();
         for name in present {
@@ -210,12 +212,12 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_one_missed_poll_without_resetting_clock() {
+    fn tolerates_short_absence_within_grace_window() {
         let mut t = SessionTracker::default();
         let t0 = Instant::now();
         t.observe(&names(&["juan"]), t0);
-        // One poll where juan is absent (rcon hiccup / lag spike).
-        assert_eq!(t.observe(&names(&[]), t0 + Duration::from_secs(60)), vec![]);
+        // A 3-minute blip (well inside the 5-minute grace window).
+        assert_eq!(t.observe(&names(&[]), t0 + Duration::from_secs(3 * 60)), vec![]);
         // Juan is back; the clock kept running from t0, so at t0+2h we
         // still cross the threshold rather than starting over.
         let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2));
@@ -223,15 +225,75 @@ mod tests {
     }
 
     #[test]
-    fn two_consecutive_misses_end_the_session() {
+    fn disconnect_four_minutes_rejoin_bridges_same_session() {
         let mut t = SessionTracker::default();
         let t0 = Instant::now();
         t.observe(&names(&["juan"]), t0);
-        t.observe(&names(&[]), t0 + Duration::from_secs(30)); // miss 1: tolerated
-        t.observe(&names(&[]), t0 + Duration::from_secs(60)); // miss 2: session ends
+        // Absent at the 4-minute mark: still within the 5-minute grace
+        // window, so the session must survive.
+        assert_eq!(t.observe(&names(&[]), t0 + Duration::from_secs(4 * 60)), vec![]);
+        // Rejoins moments later: same session, original start time.
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(4 * 60 + 30));
+        assert_eq!(anns, vec![]); // nowhere near 2h yet
+        // Milestones keep counting from the ORIGINAL t0, including the
+        // bridged gap as elapsed time.
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2));
+        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 2 }]);
+    }
+
+    #[test]
+    fn disconnect_six_minutes_rejoin_starts_new_session() {
+        let mut t = SessionTracker::default();
+        let t0 = Instant::now();
+        t.observe(&names(&["juan"]), t0);
+        // Absent at the 6-minute mark: past the 5-minute grace window, so
+        // this poll must end the session (retroactively).
+        assert_eq!(t.observe(&names(&[]), t0 + Duration::from_secs(6 * 60)), vec![]);
+        let rejoin = t0 + Duration::from_secs(6 * 60 + 30);
+        assert_eq!(t.observe(&names(&["juan"]), rejoin), vec![]);
+        // What would have been the *old* session's 2h mark (t0 + 2h) is
+        // barely past the new start, so it must NOT announce yet — the
+        // clock restarted.
+        assert_eq!(t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2)), vec![]);
+        // A full 2h from the NEW start does announce.
+        let anns = t.observe(&names(&["juan"]), rejoin + Duration::from_secs(3600 * 2));
+        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 2 }]);
+    }
+
+    #[test]
+    fn milestone_crossed_during_bridged_gap_announces_once() {
+        let mut t = SessionTracker::default();
+        let t0 = Instant::now();
+        t.observe(&names(&["juan"]), t0);
+        // Still present just before the 2h mark.
+        assert_eq!(
+            t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 + 58 * 60)),
+            vec![]
+        );
+        // Disconnects; the 2h threshold is crossed *during* this absence,
+        // but the gap (3 min) is within grace.
+        assert_eq!(
+            t.observe(&names(&[]), t0 + Duration::from_secs(3600 * 2 + 60)),
+            vec![]
+        );
+        // Reappears: the milestone announces exactly once on this poll.
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2 + 3 * 60));
+        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 2 }]);
+        // Polling again shortly after must not repeat it.
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2 + 4 * 60));
+        assert_eq!(anns, vec![]);
+    }
+
+    #[test]
+    fn absence_beyond_grace_window_ends_the_session() {
+        let mut t = SessionTracker::default();
+        let t0 = Instant::now();
+        t.observe(&names(&["juan"]), t0);
+        // Gone for 3 hours: far past the grace window.
+        t.observe(&names(&[]), t0 + Duration::from_secs(3600 * 3));
         // Juan reappears well past the old t0 + 2h mark, but since the
-        // session reset, this is a *new* session and shouldn't announce.
-        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 3));
+        // session ended, this is a *new* session and shouldn't announce.
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 4));
         assert_eq!(anns, vec![]);
     }
 
