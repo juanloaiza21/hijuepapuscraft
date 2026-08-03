@@ -1,19 +1,27 @@
 //! Session chronicle: tracks how long each hidalgo has been mounted on the
-//! ínsula and narrates milestone hours in the notify channel.
+//! ínsula, spins La Rueda de la Fortuna every half hour, and narrates
+//! milestone hours in the notify channel.
 //!
 //! [`SessionTracker`] is pure logic (no I/O, no wall-clock reads of its
 //! own) so it can be driven by a fake clock in tests. `run()` in
 //! `monitor.rs` feeds it the RCON player list every 30 s and turns the
 //! [`Announcement`]s it returns into Quijote-voiced text via
-//! [`session_message`].
+//! [`session_message`] (only for whole-hour, chronicle-eligible
+//! milestones) and wheel spins (for every milestone, including half
+//! hours).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// One crossed milestone for a session. `half_hours` is the raw tick (1 =
+/// 0:30, 2 = 1:00, 3 = 1:30, ...); `hours` is always `half_hours / 2`,
+/// i.e. full elapsed hours, kept around because `session_message` and
+/// `fortuna::spin` both key off whole hours.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Announcement {
     pub player: String,
     pub hours: u32,
+    pub half_hours: u32,
 }
 
 struct PlayerSession {
@@ -22,9 +30,9 @@ struct PlayerSession {
     /// they're absent this doesn't move; it's compared against `now` to
     /// decide whether the gap has exceeded the grace window.
     last_seen: Instant,
-    /// Highest full-hour threshold already announced for this session (0
+    /// Highest half-hour threshold already announced for this session (0
     /// means none yet).
-    last_announced_hour: u32,
+    last_announced_half_hour: u32,
 }
 
 /// How long a player's session survives a gap in presence (dropped RCON
@@ -49,14 +57,16 @@ impl SessionTracker {
     /// counts as elapsed time. An absence longer than that ends the
     /// session retroactively; a later reappearance starts a brand new one.
     /// Returns one [`Announcement`] per session that just crossed a new
-    /// full-hour threshold (>= 2h), never repeating a threshold already
-    /// announced, even if the crossing happened during a bridged gap.
+    /// half-hour threshold (>= 0:30), never repeating a threshold already
+    /// announced, even if the crossing happened during a bridged gap. The
+    /// wheel spins on every one of these; the chronicle only narrates the
+    /// whole-hour ones from 2h onward (see `hours` / `half_hours` on
+    /// [`Announcement`]).
     pub fn observe(&mut self, present: &[String], now: Instant) -> Vec<Announcement> {
         for name in present {
-            self.sessions
-                .entry(name.clone())
-                .and_modify(|s| s.last_seen = now)
-                .or_insert(PlayerSession { start: now, last_seen: now, last_announced_hour: 0 });
+            self.sessions.entry(name.clone()).and_modify(|s| s.last_seen = now).or_insert(
+                PlayerSession { start: now, last_seen: now, last_announced_half_hour: 0 },
+            );
         }
 
         // Anyone absent from this poll keeps their session alive only
@@ -70,13 +80,30 @@ impl SessionTracker {
         let mut announcements = Vec::new();
         for name in present {
             let Some(sess) = self.sessions.get_mut(name) else { continue };
-            let elapsed_hours = (now.duration_since(sess.start).as_secs() / 3600) as u32;
-            if elapsed_hours >= 2 && elapsed_hours > sess.last_announced_hour {
-                sess.last_announced_hour = elapsed_hours;
-                announcements.push(Announcement { player: name.clone(), hours: elapsed_hours });
+            let elapsed_half_hours = (now.duration_since(sess.start).as_secs() / 1800) as u32;
+            if elapsed_half_hours >= 1 && elapsed_half_hours > sess.last_announced_half_hour {
+                sess.last_announced_half_hour = elapsed_half_hours;
+                announcements.push(Announcement {
+                    player: name.clone(),
+                    hours: elapsed_half_hours / 2,
+                    half_hours: elapsed_half_hours,
+                });
             }
         }
         announcements
+    }
+
+    /// Current whole elapsed hours for `player`'s in-progress session, if
+    /// the tracker already knows about them at `now`. Used by the
+    /// deploy-round wheel spin (see `monitor::run`) to pick a milestone
+    /// for players already online when a fresh process starts, rather
+    /// than always guessing — though since this tracker's state lives
+    /// only in memory, a freshly restarted process has no session history
+    /// for anyone yet, so callers should still have a fallback for `None`.
+    pub fn current_hours(&self, player: &str, now: Instant) -> Option<u32> {
+        self.sessions
+            .get(player)
+            .map(|s| (now.duration_since(s.start).as_secs() / 3600) as u32)
     }
 }
 
@@ -174,41 +201,72 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    #[test]
-    fn no_announcement_before_two_hours() {
-        let mut t = SessionTracker::default();
-        let t0 = Instant::now();
-        assert_eq!(t.observe(&names(&["juan"]), t0), vec![]);
-        assert_eq!(
-            t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2 - 1)),
-            vec![]
-        );
+    /// Mirrors `monitor::chronicle_due`, duplicated locally so these tests
+    /// don't need to reach into `monitor.rs` — the actual predicate has
+    /// its own unit tests there.
+    fn chronicle_eligible(half_hours: u32) -> bool {
+        half_hours % 2 == 0 && half_hours >= 4
     }
 
     #[test]
-    fn announces_once_at_two_hour_threshold() {
+    fn no_announcement_before_first_half_hour() {
+        let mut t = SessionTracker::default();
+        let t0 = Instant::now();
+        assert_eq!(t.observe(&names(&["juan"]), t0), vec![]);
+        assert_eq!(t.observe(&names(&["juan"]), t0 + Duration::from_secs(30 * 60 - 1)), vec![]);
+    }
+
+    #[test]
+    fn crossing_half_hour_emits_wheel_only_milestone() {
         let mut t = SessionTracker::default();
         let t0 = Instant::now();
         t.observe(&names(&["juan"]), t0);
-        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2));
-        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 2 }]);
-        // Same hour again: no repeat.
-        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2 + 60));
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(30 * 60));
+        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 0, half_hours: 1 }]);
+        assert!(!chronicle_eligible(anns[0].half_hours), "0:30 must not be chronicle-eligible");
+        // Same half hour again: no repeat.
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(30 * 60 + 60));
         assert_eq!(anns, vec![]);
     }
 
     #[test]
-    fn announces_each_additional_full_hour_exactly_once() {
+    fn crossing_two_hours_emits_chronicle_eligible_milestone() {
         let mut t = SessionTracker::default();
         let t0 = Instant::now();
         t.observe(&names(&["juan"]), t0);
-        for h in 2..=5u64 {
-            let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * h));
-            assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: h as u32 }]);
-            // Poll again mid-hour: no duplicate.
-            let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * h + 100));
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2));
+        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 2, half_hours: 4 }]);
+        assert!(chronicle_eligible(anns[0].half_hours), "2:00 must be chronicle-eligible");
+    }
+
+    #[test]
+    fn three_hour_continuous_session_emits_six_half_hour_milestones_without_repeats() {
+        let mut t = SessionTracker::default();
+        let t0 = Instant::now();
+        t.observe(&names(&["juan"]), t0);
+        let mut all = Vec::new();
+        for hh in 1..=6u64 {
+            let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(1800 * hh));
+            all.extend(anns);
+            // Poll again mid-half-hour: no duplicate.
+            let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(1800 * hh + 100));
             assert_eq!(anns, vec![]);
         }
+        let expected: Vec<Announcement> = (1..=6u32)
+            .map(|hh| Announcement { player: "juan".into(), hours: hh / 2, half_hours: hh })
+            .collect();
+        assert_eq!(all, expected);
+        assert_eq!(all.len(), 6, "0:30..3:00 is six half-hour milestones");
+
+        // No milestone ever repeats.
+        let unique: std::collections::HashSet<_> = all.iter().map(|a| a.half_hours).collect();
+        assert_eq!(unique.len(), all.len());
+
+        // Only the whole-hour ones (1:00, 2:00, 3:00 -> half_hours 2,4,6)
+        // are chronicle-eligible.
+        let eligible: Vec<u32> =
+            all.iter().filter(|a| chronicle_eligible(a.half_hours)).map(|a| a.half_hours).collect();
+        assert_eq!(eligible, vec![4, 6], "only >=2h whole-hour marks are chronicle-eligible");
     }
 
     #[test]
@@ -218,10 +276,10 @@ mod tests {
         t.observe(&names(&["juan"]), t0);
         // A 3-minute blip (well inside the 5-minute grace window).
         assert_eq!(t.observe(&names(&[]), t0 + Duration::from_secs(3 * 60)), vec![]);
-        // Juan is back; the clock kept running from t0, so at t0+2h we
+        // Juan is back; the clock kept running from t0, so at t0+30m we
         // still cross the threshold rather than starting over.
-        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2));
-        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 2 }]);
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(30 * 60));
+        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 0, half_hours: 1 }]);
     }
 
     #[test]
@@ -234,11 +292,11 @@ mod tests {
         assert_eq!(t.observe(&names(&[]), t0 + Duration::from_secs(4 * 60)), vec![]);
         // Rejoins moments later: same session, original start time.
         let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(4 * 60 + 30));
-        assert_eq!(anns, vec![]); // nowhere near 2h yet
+        assert_eq!(anns, vec![]); // nowhere near 0:30 yet
         // Milestones keep counting from the ORIGINAL t0, including the
         // bridged gap as elapsed time.
-        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2));
-        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 2 }]);
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(30 * 60));
+        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 0, half_hours: 1 }]);
     }
 
     #[test]
@@ -251,13 +309,13 @@ mod tests {
         assert_eq!(t.observe(&names(&[]), t0 + Duration::from_secs(6 * 60)), vec![]);
         let rejoin = t0 + Duration::from_secs(6 * 60 + 30);
         assert_eq!(t.observe(&names(&["juan"]), rejoin), vec![]);
-        // What would have been the *old* session's 2h mark (t0 + 2h) is
+        // What would have been the *old* session's 0:30 mark (t0 + 30m) is
         // barely past the new start, so it must NOT announce yet — the
         // clock restarted.
-        assert_eq!(t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2)), vec![]);
-        // A full 2h from the NEW start does announce.
-        let anns = t.observe(&names(&["juan"]), rejoin + Duration::from_secs(3600 * 2));
-        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 2 }]);
+        assert_eq!(t.observe(&names(&["juan"]), t0 + Duration::from_secs(30 * 60)), vec![]);
+        // A full 30 min from the NEW start does announce.
+        let anns = t.observe(&names(&["juan"]), rejoin + Duration::from_secs(30 * 60));
+        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 0, half_hours: 1 }]);
     }
 
     #[test]
@@ -265,22 +323,16 @@ mod tests {
         let mut t = SessionTracker::default();
         let t0 = Instant::now();
         t.observe(&names(&["juan"]), t0);
-        // Still present just before the 2h mark.
-        assert_eq!(
-            t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 + 58 * 60)),
-            vec![]
-        );
-        // Disconnects; the 2h threshold is crossed *during* this absence,
-        // but the gap (3 min) is within grace.
-        assert_eq!(
-            t.observe(&names(&[]), t0 + Duration::from_secs(3600 * 2 + 60)),
-            vec![]
-        );
+        // Still present just before the 0:30 mark.
+        assert_eq!(t.observe(&names(&["juan"]), t0 + Duration::from_secs(28 * 60)), vec![]);
+        // Disconnects; the 0:30 threshold is crossed *during* this
+        // absence, but the gap (3 min) is within grace.
+        assert_eq!(t.observe(&names(&[]), t0 + Duration::from_secs(31 * 60)), vec![]);
         // Reappears: the milestone announces exactly once on this poll.
-        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2 + 3 * 60));
-        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 2 }]);
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(33 * 60));
+        assert_eq!(anns, vec![Announcement { player: "juan".into(), hours: 0, half_hours: 1 }]);
         // Polling again shortly after must not repeat it.
-        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 2 + 4 * 60));
+        let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(34 * 60));
         assert_eq!(anns, vec![]);
     }
 
@@ -291,8 +343,9 @@ mod tests {
         t.observe(&names(&["juan"]), t0);
         // Gone for 3 hours: far past the grace window.
         t.observe(&names(&[]), t0 + Duration::from_secs(3600 * 3));
-        // Juan reappears well past the old t0 + 2h mark, but since the
-        // session ended, this is a *new* session and shouldn't announce.
+        // Juan reappears well past where old milestones would have been,
+        // but since the session ended, this is a *new* session and
+        // shouldn't announce.
         let anns = t.observe(&names(&["juan"]), t0 + Duration::from_secs(3600 * 4));
         assert_eq!(anns, vec![]);
     }
@@ -304,12 +357,23 @@ mod tests {
         t.observe(&names(&["juan"]), t0);
         // ana joins one poll later.
         t.observe(&names(&["juan", "ana"]), t0 + Duration::from_secs(30));
-        let anns = t.observe(&names(&["juan", "ana"]), t0 + Duration::from_secs(3600 * 2 + 30));
-        // juan started at t0, ana at t0+30s; both cross 2h in this same
-        // poll (30s granularity doesn't push ana past the 2h boundary yet).
+        let anns = t.observe(&names(&["juan", "ana"]), t0 + Duration::from_secs(30 * 60 + 30));
+        // juan started at t0, ana at t0+30s; both cross 0:30 in this same
+        // poll (30s granularity doesn't push ana past the boundary yet).
         let mut players: Vec<_> = anns.iter().map(|a| a.player.clone()).collect();
         players.sort();
         assert_eq!(players, vec!["ana".to_string(), "juan".to_string()]);
+    }
+
+    #[test]
+    fn current_hours_reflects_in_progress_session_and_none_when_unknown() {
+        let mut t = SessionTracker::default();
+        let t0 = Instant::now();
+        assert_eq!(t.current_hours("juan", t0), None);
+        t.observe(&names(&["juan"]), t0);
+        assert_eq!(t.current_hours("juan", t0), Some(0));
+        assert_eq!(t.current_hours("juan", t0 + Duration::from_secs(3600 * 5)), Some(5));
+        assert_eq!(t.current_hours("ana", t0), None);
     }
 
     #[test]

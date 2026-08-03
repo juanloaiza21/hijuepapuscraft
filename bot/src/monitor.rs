@@ -177,13 +177,82 @@ impl BackupWatch {
     }
 }
 
+/// Whether a crossed half-hour milestone is worth a chronicle roast
+/// message. The wheel spins on every milestone `SessionTracker::observe`
+/// emits, but the chronicle keeps its old, coarser cadence: whole hours
+/// only (`half_hours` even), starting at the 2h floor (`half_hours >= 4`).
+/// So 0:30/1:00/1:30 spin silently, 2:00 is the first chronicle-eligible
+/// one, 2:30 spins silently, 3:00 is chronicle-eligible again, etc.
+fn chronicle_due(half_hours: u32) -> bool {
+    half_hours % 2 == 0 && half_hours >= 4
+}
+
+/// Milestone hours to use when spinning the deploy-round wheel (see
+/// `run`'s first-tick handling) for a player who's already online at
+/// startup. Prefers the tracker's own record of their current session if
+/// one exists, falling back to the 2h floor otherwise. In practice the
+/// fallback is what always fires: `SessionTracker` state lives only in
+/// memory, so a freshly restarted process never has session history for
+/// anyone yet — this function exists so that stays true by construction
+/// rather than by accident if that ever changes.
+fn deploy_round_hours(current_session_hours: Option<u32>) -> u32 {
+    current_session_hours.unwrap_or(2)
+}
+
+/// Spin the wheel for `player` at `hours` and carry out the result: RCON
+/// `say` + effect commands, then narrate in the notify channel. Shared by
+/// the ordinary per-milestone spin and the deploy-round catch-up spin so
+/// both go through identical execution. RCON failures here are logged and
+/// swallowed, never propagated — a hiccup spinning the wheel must never
+/// take down the monitor loop. No-ops for names `fortuna::valid_player_name`
+/// rejects.
+async fn spin_wheel_for(
+    channel: ChannelId,
+    http: &Http,
+    rcon: &Arc<Mutex<McRcon>>,
+    fortune_rng: &mut fortuna::EntropyRolls,
+    player: &str,
+    hours: u32,
+) {
+    if !fortuna::valid_player_name(player) {
+        return;
+    }
+    let spin = fortuna::spin(player, hours, fortune_rng);
+    tracing::info!(
+        "la rueda de la fortuna: {} @ {}h -> {} ({:?})",
+        player,
+        hours,
+        spin.effect_id,
+        spin.category
+    );
+    {
+        let mut r = rcon.lock().await;
+        if let Err(e) = r.cmd(&format!("say {}", spin.game_msg)).await {
+            tracing::warn!("fortuna: rcon say failed: {e:#}");
+        }
+        for cmd in &spin.commands {
+            if let Err(e) = r.cmd(cmd).await {
+                tracing::warn!("fortuna: rcon command {cmd:?} failed: {e:#}");
+            }
+        }
+    }
+    let _ = channel.say(http, spin.discord_msg).await;
+}
+
 /// 30 s loop. Owns its own damper and watch; sends notifications to the
-/// configured channel. Spawned from main after the Discord client is ready.
+/// configured channel. Spawned from main after the Discord client is
+/// ready. `announce_deploy_round` mirrors the changelog decision main.rs
+/// already made (`changelog::should_announce`): when true, this is a
+/// genuinely new build, and the very first tick spins the wheel once for
+/// every player already online so a deploy never leaves the ínsula
+/// waiting for its next milestone. It stays false — and the deploy round
+/// stays silent — on ordinary restarts of the same build.
 pub async fn run(
     http: Arc<Http>,
     cfg: Config,
     docker: DockerCtl,
     rcon: Arc<Mutex<McRcon>>,
+    announce_deploy_round: bool,
 ) {
     let channel = ChannelId::new(cfg.notify_channel_id);
     let mut damper = Damper::new(ServerState::Down);
@@ -192,6 +261,7 @@ pub async fn run(
     let mut herald = Herald::new();
     let mut fortune_rng = fortuna::EntropyRolls::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut first_tick = true;
     loop {
         tick.tick().await;
 
@@ -240,8 +310,11 @@ pub async fn run(
         }
 
         // Session chronicle: feed the RCON player list into the presence
-        // tracker and narrate any milestone hours crossed this tick. An
-        // unparseable or failed `list` reads as nobody present, which is
+        // tracker, which now surfaces one milestone per crossed HALF hour
+        // (0:30, 1:00, 1:30, ...). The wheel (La Rueda de la Fortuna) spins
+        // on every one of those; Don Quijote's chronicle roast only fires
+        // on the whole-hour milestones from 2h onward, per `chronicle_due`.
+        // An unparseable or failed `list` reads as nobody present, which is
         // fine: SessionTracker tolerates absences up to its 5-minute grace
         // window before ending a session.
         let present = list_result
@@ -250,35 +323,40 @@ pub async fn run(
             .and_then(parse::parse_list)
             .map(|p| p.names)
             .unwrap_or_default();
-        for ann in sessions.observe(&present, Instant::now()) {
-            let _ = channel.say(&http, chronicle::session_message(&ann.player, ann.hours)).await;
 
-            // La Rueda de la Fortuna: spin for this milestone and turn the
-            // result into real RCON consequences. RCON failures here are
-            // logged and swallowed, never propagated — a hiccup spinning
-            // the wheel must never take down the monitor loop.
-            if fortuna::valid_player_name(&ann.player) {
-                let spin = fortuna::spin(&ann.player, ann.hours, &mut fortune_rng);
-                tracing::info!(
-                    "la rueda de la fortuna: {} @ {}h -> {} ({:?})",
-                    ann.player,
-                    ann.hours,
-                    spin.effect_id,
-                    spin.category
-                );
-                {
-                    let mut r = rcon.lock().await;
-                    if let Err(e) = r.cmd(&format!("say {}", spin.game_msg)).await {
-                        tracing::warn!("fortuna: rcon say failed: {e:#}");
-                    }
-                    for cmd in &spin.commands {
-                        if let Err(e) = r.cmd(cmd).await {
-                            tracing::warn!("fortuna: rcon command {cmd:?} failed: {e:#}");
-                        }
-                    }
-                }
-                let _ = channel.say(&http, spin.discord_msg).await;
+        // Deploy round: only on this process's very first tick, and only
+        // when main.rs already decided this build is genuinely new (never
+        // on a same-build crash/patch restart). Spins once for every
+        // player already online so a fresh deploy doesn't leave anyone
+        // waiting out a fresh half hour before the wheel notices them.
+        if first_tick && announce_deploy_round && !present.is_empty() {
+            let _ = channel
+                .say(
+                    &http,
+                    ":ferris_wheel: Nueva singladura del código, y la Rueda quiere estrenarla: gira una vez por cada caballero presente.",
+                )
+                .await;
+        }
+
+        let anns = sessions.observe(&present, Instant::now());
+
+        if first_tick && announce_deploy_round && !present.is_empty() {
+            for player in &present {
+                let hours = deploy_round_hours(sessions.current_hours(player, Instant::now()));
+                spin_wheel_for(channel, &http, &rcon, &mut fortune_rng, player, hours).await;
             }
+        }
+        first_tick = false;
+
+        for ann in anns {
+            if chronicle_due(ann.half_hours) {
+                let _ = channel.say(&http, chronicle::session_message(&ann.player, ann.hours)).await;
+            }
+
+            // La Rueda de la Fortuna: spin for EVERY milestone (each half
+            // hour of continuous session), and turn the result into real
+            // RCON consequences.
+            spin_wheel_for(channel, &http, &rcon, &mut fortune_rng, &ann.player, ann.hours).await;
         }
 
         // Deeds ledger: tail mc's log for freshly-earned advancements,
@@ -296,6 +374,28 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chronicle_due_only_whole_hours_from_two_up() {
+        // Half-hour milestones (odd, or below the 2h floor) never fire the
+        // chronicle, only the wheel.
+        for hh in [0u32, 1, 2, 3] {
+            assert!(!chronicle_due(hh), "half_hours={hh} should not be chronicle-due");
+        }
+        // 2:00, 2:30 (wheel-only), 3:00, 3:30 (wheel-only), 4:00...
+        assert!(chronicle_due(4)); // 2:00
+        assert!(!chronicle_due(5)); // 2:30
+        assert!(chronicle_due(6)); // 3:00
+        assert!(!chronicle_due(7)); // 3:30
+        assert!(chronicle_due(8)); // 4:00
+    }
+
+    #[test]
+    fn deploy_round_hours_uses_session_when_known_else_floor() {
+        assert_eq!(deploy_round_hours(Some(5)), 5);
+        assert_eq!(deploy_round_hours(Some(0)), 0);
+        assert_eq!(deploy_round_hours(None), 2);
+    }
 
     #[test]
     fn classify_maps_observations() {

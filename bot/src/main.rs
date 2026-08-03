@@ -24,6 +24,23 @@ fn state_dir() -> String {
     std::env::var("BOT_STATE_DIR").unwrap_or_else(|_| "/data".to_string())
 }
 
+/// Reads the last-announced build sha from the state file, tolerating a
+/// missing file (first-ever run) as "nothing announced yet". IO failures
+/// are logged and swallowed — a hiccup here must never block or fail
+/// startup, and the caller treats them the same as "nothing announced".
+fn read_last_announced_build() -> Option<String> {
+    let dir = state_dir();
+    let state_path = std::path::Path::new(&dir).join("last_announced_build");
+    match std::fs::read_to_string(&state_path) {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!("changelog: failed to read state file {}: {e:#}", state_path.display());
+            None
+        }
+    }
+}
+
 /// Reads the last-announced build sha, and if the currently running build
 /// is new, posts a Quijote-voiced changelog to the notify channel and
 /// persists the new sha so the next restart of *this* build stays quiet.
@@ -34,15 +51,7 @@ async fn announce_changelog_if_new(http: &Arc<serenity::Http>, cfg: &Config) {
     let dir = state_dir();
     let state_path = std::path::Path::new(&dir).join("last_announced_build");
     let current_sha = env!("GIT_SHA");
-
-    let last_announced = match std::fs::read_to_string(&state_path) {
-        Ok(s) => Some(s.trim().to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            tracing::warn!("changelog: failed to read state file {}: {e:#}", state_path.display());
-            None
-        }
-    };
+    let last_announced = read_last_announced_build();
 
     if !changelog::should_announce(current_sha, last_announced.as_deref()) {
         tracing::info!("changelog: build {current_sha} already announced, staying quiet");
@@ -107,6 +116,13 @@ async fn main() -> anyhow::Result<()> {
     let monitor_cfg = cfg.clone();
     let monitor_docker = docker.clone();
     let monitor_rcon = rcon.clone();
+    // Same "is this a genuinely new build" decision `announce_changelog_if_new`
+    // makes below (and will re-derive independently there, before writing
+    // the state file — no race, since nothing writes it in between); computed
+    // here too so `monitor::run`'s deploy-round wheel spin can key off it
+    // without threading the changelog module's side effects through it.
+    let announce_deploy_round =
+        changelog::should_announce(env!("GIT_SHA"), read_last_announced_build().as_deref());
     // Grab the token before `cfg` moves into the setup closure below;
     // avoids re-reading env vars a second time to get it back out.
     let token = cfg.discord_token.clone();
@@ -125,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
                     monitor_cfg,
                     monitor_docker,
                     monitor_rcon,
+                    announce_deploy_round,
                 ));
                 if let Err(e) = poise::builtins::register_in_guild(
                     ctx,
