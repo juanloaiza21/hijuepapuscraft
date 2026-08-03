@@ -242,6 +242,26 @@ pub async fn wl_list(ctx: Ctx<'_>) -> Result<(), Error> {
 /// Translates vanilla whitelist RCON responses into the hidalgo's tongue.
 /// The raw server text is matched by its stable English substrings; anything
 /// unrecognized is wrapped rather than echoed bare, so operators still see it.
+/// Proclamations for knights admitted through the EasyWhitelist door, i.e.
+/// those whose names Mojang has never heard because they never paid.
+/// Chosen deterministically by name length so the same pauper gets the
+/// same jab every time.
+const POBRE_POOL: &[&str] = &[
+    ":coin: ¡Regocijaos a medias! **{name}** entra en el padrón, mas por la puerta de servicio: \
+     no le halla Mojang en sus registros, que jamás vio un maravedí suyo. Bienvenido sea el pobre.",
+    ":coin: Armado caballero queda **{name}**, aunque conste en acta: su cuenta es tan falsa como \
+     los gigantes de mi imaginación, y su bolsa más vacía que la despensa de Sancho.",
+    ":coin: Admitido sea **{name}** por la vía de los menesterosos. Mojang no lo conoce, y con razón: \
+     antes gastaría el hidalgo en yelmos de barbero que este en su propio juego.",
+    ":coin: Pasa **{name}** al padrón sin pagar peaje, como quien entra a la venta por el corral. \
+     Que nadie se lo eche en cara... salvo yo, que para eso soy el cronista.",
+];
+
+fn pobre_message(name: &str) -> String {
+    let idx = name.chars().count() % POBRE_POOL.len();
+    POBRE_POOL[idx].replace("{name}", name)
+}
+
 fn quixotify_whitelist(raw: &str) -> String {
     let r = raw.trim();
     if let Some(name) = r.strip_prefix("Added ").and_then(|s| s.strip_suffix(" to the whitelist")) {
@@ -291,13 +311,20 @@ fn easywhitelist_fallback(cmd: &str) -> Option<String> {
 
 async fn whitelist_cmd(ctx: Ctx<'_>, cmd: &str) -> Result<(), Error> {
     let first = { ctx.data().rcon.lock().await.cmd(cmd).await };
+    let mut via_pauper_door = false;
     let out = match first {
         Ok(out) => {
             if out.contains("does not exist") {
                 match easywhitelist_fallback(cmd) {
                     Some(alt) => {
                         tracing::info!(%cmd, "mojang lookup failed, retrying via easywhitelist");
-                        ctx.data().rcon.lock().await.cmd(&alt).await.unwrap_or(out)
+                        match ctx.data().rcon.lock().await.cmd(&alt).await {
+                            Ok(second) => {
+                                via_pauper_door = true;
+                                second
+                            }
+                            Err(_) => out,
+                        }
                     }
                     None => out,
                 }
@@ -311,7 +338,14 @@ async fn whitelist_cmd(ctx: Ctx<'_>, cmd: &str) -> Result<(), Error> {
             return Ok(());
         }
     };
-    ctx.say(quixotify_whitelist(&out)).await?;
+    let added_name = out
+        .trim()
+        .strip_prefix("Added ")
+        .and_then(|s| s.strip_suffix(" to the whitelist"));
+    match (via_pauper_door, added_name) {
+        (true, Some(name)) => ctx.say(pobre_message(name)).await?,
+        _ => ctx.say(quixotify_whitelist(&out)).await?,
+    };
     Ok(())
 }
 
@@ -455,6 +489,23 @@ pub async fn fortuna(
 #[cfg(test)]
 mod tests {
     use super::quixotify_whitelist;
+
+    #[test]
+    fn pauper_proclamations_name_the_pauper_and_vary() {
+        use super::{pobre_message, POBRE_POOL};
+        for name in ["Bispannus", "x", "CamRG121", "unnombrelargo16"] {
+            let m = pobre_message(name);
+            assert!(m.contains(name), "missing name: {m}");
+            assert!(!m.contains("{name}"), "placeholder left: {m}");
+        }
+        assert!(POBRE_POOL.len() >= 3);
+        let mut sorted: Vec<&str> = POBRE_POOL.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), POBRE_POOL.len(), "duplicate pauper lines");
+        // different name lengths reach different lines
+        assert_ne!(pobre_message("ab"), pobre_message("abc"));
+    }
 
     #[test]
     fn falls_back_to_easywhitelist_for_add_and_remove() {
