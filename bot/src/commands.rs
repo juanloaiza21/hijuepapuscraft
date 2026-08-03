@@ -275,14 +275,43 @@ fn quixotify_whitelist(raw: &str) -> String {
     format!("Responde la ínsula con palabras que este hidalgo no alcanza a versar: *{r}*")
 }
 
+/// Vanilla `whitelist add/remove` resolves names through Mojang, so it
+/// rejects the offline-account friends EasyAuth exists to welcome. When
+/// the server answers "does not exist", retry the same operation through
+/// EasyWhitelist, which keeps a name-based roster. Returns the response
+/// worth showing the user.
+fn easywhitelist_fallback(cmd: &str) -> Option<String> {
+    let rest = cmd.strip_prefix("whitelist ")?;
+    let (op, target) = rest.split_once(' ')?;
+    if op != "add" && op != "remove" {
+        return None;
+    }
+    Some(format!("easywhitelist {op} {target}"))
+}
+
 async fn whitelist_cmd(ctx: Ctx<'_>, cmd: &str) -> Result<(), Error> {
-    match ctx.data().rcon.lock().await.cmd(cmd).await {
-        Ok(out) => ctx.say(quixotify_whitelist(&out)).await?,
+    let first = { ctx.data().rcon.lock().await.cmd(cmd).await };
+    let out = match first {
+        Ok(out) => {
+            if out.contains("does not exist") {
+                match easywhitelist_fallback(cmd) {
+                    Some(alt) => {
+                        tracing::info!(%cmd, "mojang lookup failed, retrying via easywhitelist");
+                        ctx.data().rcon.lock().await.cmd(&alt).await.unwrap_or(out)
+                    }
+                    None => out,
+                }
+            } else {
+                out
+            }
+        }
         Err(_) => {
             ctx.say("Duerme la ínsula; para tocar el padrón de caballeros ha de estar despierta.")
-                .await?
+                .await?;
+            return Ok(());
         }
     };
+    ctx.say(quixotify_whitelist(&out)).await?;
     Ok(())
 }
 
@@ -426,6 +455,27 @@ pub async fn fortuna(
 #[cfg(test)]
 mod tests {
     use super::quixotify_whitelist;
+
+    #[test]
+    fn falls_back_to_easywhitelist_for_add_and_remove() {
+        use super::easywhitelist_fallback;
+        assert_eq!(
+            easywhitelist_fallback("whitelist add Bispannus").as_deref(),
+            Some("easywhitelist add Bispannus")
+        );
+        assert_eq!(
+            easywhitelist_fallback("whitelist remove Bispannus").as_deref(),
+            Some("easywhitelist remove Bispannus")
+        );
+    }
+
+    #[test]
+    fn no_fallback_for_list_or_foreign_commands() {
+        use super::easywhitelist_fallback;
+        assert!(easywhitelist_fallback("whitelist list").is_none());
+        assert!(easywhitelist_fallback("say hola").is_none());
+        assert!(easywhitelist_fallback("whitelist").is_none());
+    }
 
     #[test]
     fn knights_added_players_by_name() {
