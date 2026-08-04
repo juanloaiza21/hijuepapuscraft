@@ -1,11 +1,13 @@
 use crate::chronicle::{self, SessionTracker};
 use crate::config::Config;
-use crate::docker::DockerCtl;
+use crate::docker::{self, DockerCtl};
 use crate::fortuna;
 use crate::heraldo::Herald;
 use crate::parse;
 use crate::rcon::McRcon;
-use poise::serenity_prelude::{ChannelId, Http};
+use poise::serenity_prelude::{
+    ChannelId, CreateAllowedMentions, CreateMessage, Http, RoleId,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,9 +19,21 @@ pub enum ServerState {
     Starting,
     Unhealthy,
     Down,
+    /// Stuck mid-lifecycle per podman's own `State.Status` (stopping,
+    /// removing, dead, paused) — distinct from `Down` because neither
+    /// `/start` nor `/restart` can recover it; only the host watchdog's
+    /// `podman rm -f` + recreate can. See `docker::is_wedged`.
+    Wedged,
 }
 
-pub fn classify(running: bool, health: Option<&str>, rcon_ok: bool) -> ServerState {
+/// `status` is podman's raw `State.Status` (see `docker::ContainerStatus`).
+/// It wins over every other signal — including a stale/misleading
+/// `running` flag — because it is the one field that names a wedge
+/// instead of letting it masquerade as a clean stop or a healthy server.
+pub fn classify(status: Option<&str>, running: bool, health: Option<&str>, rcon_ok: bool) -> ServerState {
+    if docker::is_wedged(status) {
+        return ServerState::Wedged;
+    }
     if !running {
         return ServerState::Down;
     }
@@ -44,13 +58,53 @@ const INSTABILITY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 /// window-based pruning already keeps it small in ordinary operation.
 const MAX_TRACKED_RESETS: usize = 16;
 
+/// How long a confirmed non-Up state must persist before the Damper pages
+/// again: 5, 15, 30, then 60 minutes. This is what turns the Damper from
+/// edge-triggered (one message, ever, per outage — the incident's exact
+/// failure mode) into duration-aware: it fires again and again for as long
+/// as the ínsula stays down or wedged, instead of going silent forever
+/// after the first transition.
+const ESCALATION_LADDER: [Duration; 4] = [
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(30 * 60),
+    Duration::from_secs(60 * 60),
+];
+/// Once the ladder's last rung (60 min) has fired, keep paging at this
+/// cadence forever, so a wedge that outlives a full day still gets an
+/// hourly nudge instead of relapsing into silence.
+const ESCALATION_REPEAT: Duration = Duration::from_secs(60 * 60);
+
+/// How long a state must have persisted for the `escalations_sent`-th
+/// escalation (0-indexed) to fire.
+fn escalation_threshold(escalations_sent: usize) -> Duration {
+    match ESCALATION_LADDER.get(escalations_sent) {
+        Some(&d) => d,
+        None => {
+            let extra = (escalations_sent - ESCALATION_LADDER.len() + 1) as u32;
+            *ESCALATION_LADDER.last().expect("ladder is non-empty") + ESCALATION_REPEAT * extra
+        }
+    }
+}
+
+/// One escalation: the ínsula has been stuck in `state` (never `Up`) for
+/// at least `elapsed`, and this is the next rung of `ESCALATION_LADDER` to
+/// fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Escalation {
+    pub state: ServerState,
+    pub elapsed: Duration,
+}
+
 /// What a single [`Damper::observe`] call produced: an optional confirmed
-/// state transition, and whether this reading pushed the flap-reset count
-/// over the instability threshold.
+/// state transition, whether this reading pushed the flap-reset count over
+/// the instability threshold, and an optional escalation if the current
+/// (non-Up) state has just crossed the next rung of the ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DamperSignal {
     pub transition: Option<ServerState>,
     pub instability: bool,
+    pub escalation: Option<Escalation>,
 }
 
 pub struct Damper {
@@ -64,18 +118,42 @@ pub struct Damper {
     /// Set once an instability signal fires; further resets before this
     /// instant are tracked-but-silent.
     suppressed_until: Option<Instant>,
+    /// Wall-clock instant `current` was last confirmed to change, seeded
+    /// lazily on the first `observe()` call rather than read at
+    /// construction time — same reasoning as
+    /// `chronicle::PlayerSession::start` — so `Damper::new` stays a pure,
+    /// clockless constructor and every timestamp still comes from an
+    /// injected `now`.
+    state_since: Option<Instant>,
+    /// How many rungs of `ESCALATION_LADDER` (+ repeats) have already
+    /// fired for the current unbroken non-Up stretch. Reset to 0 whenever
+    /// `current` transitions back to `Up`.
+    escalations_sent: usize,
 }
 
 impl Damper {
     pub fn new(initial: ServerState) -> Self {
-        Self { current: initial, pending: None, flap_resets: VecDeque::new(), suppressed_until: None }
+        Self {
+            current: initial,
+            pending: None,
+            flap_resets: VecDeque::new(),
+            suppressed_until: None,
+            state_since: None,
+            escalations_sent: 0,
+        }
     }
 
-    /// Feed one poll reading. `now` drives both the ordinary damper (for
-    /// nothing, currently) and the flap-instability window/cooldown, and is
+    /// Feed one poll reading. `now` drives the ordinary damper, the
+    /// flap-instability window/cooldown, and the escalation ladder, and is
     /// injected (rather than read internally) so tests can drive it with a
     /// fake clock, same style as `chronicle::SessionTracker::observe`.
     pub fn observe(&mut self, s: ServerState, now: Instant) -> DamperSignal {
+        // Seed state_since on the very first observation ever, so a
+        // Damper constructed already-non-Up (e.g. `Damper::new(Down)` at
+        // boot) still starts its escalation clock somewhere sane. Any
+        // later confirmed transition overwrites this below.
+        self.state_since.get_or_insert(now);
+
         let mut reset = false;
         let transition = if s == self.current {
             // A reading matching current discards any pending transition.
@@ -90,6 +168,10 @@ impl Damper {
                 if n + 1 >= 2 {
                     self.current = s;
                     self.pending = None;
+                    self.state_since = Some(now);
+                    if s == ServerState::Up {
+                        self.escalations_sent = 0;
+                    }
                     Some(s)
                 } else {
                     self.pending = Some((p, n + 1));
@@ -110,7 +192,22 @@ impl Damper {
         };
 
         let instability = if reset { self.record_flap_reset(now) } else { false };
-        DamperSignal { transition, instability }
+
+        let escalation = if self.current != ServerState::Up {
+            let since = self.state_since.expect("seeded above");
+            let elapsed = now.saturating_duration_since(since);
+            let threshold = escalation_threshold(self.escalations_sent);
+            if elapsed >= threshold {
+                self.escalations_sent += 1;
+                Some(Escalation { state: self.current, elapsed })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        DamperSignal { transition, instability, escalation }
     }
 
     /// Record a flap reset at `now`, prune stale entries outside the
@@ -268,18 +365,24 @@ pub async fn run(
         let mc = docker.inspect("mc").await.ok().flatten();
         let list_result = { rcon.lock().await.cmd("list").await };
         let rcon_ok = list_result.is_ok();
+        let status = mc.as_ref().and_then(|s| s.status.clone());
         let state = classify(
+            status.as_deref(),
             mc.as_ref().map(|s| s.running).unwrap_or(false),
             mc.as_ref().and_then(|s| s.health.as_deref()),
             rcon_ok,
         );
         let signal = damper.observe(state, Instant::now());
         if let Some(t) = signal.transition {
-            let msg = match t {
-                ServerState::Up => ":green_circle: ¡En pie está la ínsula! Presta para recibir a sus caballeros.",
-                ServerState::Starting => ":yellow_circle: La ínsula despereza sus engranajes; aguarde vuestra merced, que ya despierta.",
-                ServerState::Unhealthy => ":orange_circle: La ínsula sufre de melancolía en sus engranajes (el tick loop flaquea). Considere vuestra merced un /restart.",
-                ServerState::Down => ":red_circle: ¡Ha caído la ínsula! Los follones y malandrines han triunfado... por ahora.",
+            let msg: String = match t {
+                ServerState::Up => ":green_circle: ¡En pie está la ínsula! Presta para recibir a sus caballeros.".into(),
+                ServerState::Starting => ":yellow_circle: La ínsula despereza sus engranajes; aguarde vuestra merced, que ya despierta.".into(),
+                ServerState::Unhealthy => ":orange_circle: La ínsula sufre de melancolía en sus engranajes (el tick loop flaquea). Considere vuestra merced un /restart.".into(),
+                ServerState::Down => ":red_circle: ¡Ha caído la ínsula! Los follones y malandrines han triunfado... por ahora.".into(),
+                ServerState::Wedged => format!(
+                    ":skull: ¡La ínsula ha quedado TRABADA! Podman la reporta en el estado '{}': ni /start ni /restart pueden ya desatascarla — es un mal encantamiento en sus entrañas, no un reposo. El vigía del castillo (host) la reconstruirá en pocos minutos.",
+                    status.as_deref().unwrap_or("desconocido")
+                ),
             };
             let _ = channel.say(&http, msg).await;
         }
@@ -290,6 +393,26 @@ pub async fn run(
                     ":warning: ¡La ínsula tiembla, vuestra merced! Cae y se alza sin cesar, como aspa de molino en tormenta. Un mal presagio: acuda alguien del consejo a mirar los logs.",
                 )
                 .await;
+        }
+        if let Some(esc) = signal.escalation {
+            let mins = esc.elapsed.as_secs() / 60;
+            let role_ping = format!("<@&{}>", cfg.admin_role_id);
+            let body = match esc.state {
+                ServerState::Wedged => format!(
+                    "{role_ping} :rotating_light: La ínsula sigue TRABADA hace {mins} minutos (podman: estado '{}'). Ni /start ni /restart la remedian; el vigía del castillo obrará, mas acuda vuestra merced si tarda.",
+                    status.as_deref().unwrap_or("desconocido")
+                ),
+                _ => format!(
+                    "{role_ping} :rotating_light: La ínsula lleva {mins} minutos sin levantarse ({esc_state:?}). Acuda alguien del consejo a mirar los logs; este hidalgo no callará mientras dure la caída.",
+                    esc_state = esc.state
+                ),
+            };
+            let reply = CreateMessage::new()
+                .content(body)
+                .allowed_mentions(CreateAllowedMentions::new().roles(vec![RoleId::new(cfg.admin_role_id)]));
+            if let Err(e) = channel.send_message(&http, reply).await {
+                tracing::warn!("failed to post escalation: {e:#}");
+            }
         }
 
         if let Ok(Some(b)) = docker.inspect("mc-backup").await {
@@ -399,14 +522,36 @@ mod tests {
 
     #[test]
     fn classify_maps_observations() {
-        assert_eq!(classify(false, None, false), ServerState::Down);
-        assert_eq!(classify(true, Some("starting"), false), ServerState::Starting);
-        assert_eq!(classify(true, Some("healthy"), true), ServerState::Up);
-        assert_eq!(classify(true, Some("unhealthy"), true), ServerState::Unhealthy);
+        assert_eq!(classify(None, false, None, false), ServerState::Down);
+        assert_eq!(classify(None, true, Some("starting"), false), ServerState::Starting);
+        assert_eq!(classify(None, true, Some("healthy"), true), ServerState::Up);
+        assert_eq!(classify(None, true, Some("unhealthy"), true), ServerState::Unhealthy);
         // running, no healthcheck info, rcon answers: that's up
-        assert_eq!(classify(true, None, true), ServerState::Up);
+        assert_eq!(classify(None, true, None, true), ServerState::Up);
         // running but rcon dead and no health: still starting, not down
-        assert_eq!(classify(true, None, false), ServerState::Starting);
+        assert_eq!(classify(None, true, None, false), ServerState::Starting);
+    }
+
+    #[test]
+    fn wedged_wins_over_running_flag() {
+        // podman's own status pins the container as stuck mid-lifecycle
+        // even when other signals disagree — including a `running: true`
+        // that can briefly coexist with `status: "stopping"`.
+        assert_eq!(classify(Some("stopping"), false, Some("healthy"), false), ServerState::Wedged);
+        assert_eq!(classify(Some("stopping"), true, Some("healthy"), true), ServerState::Wedged);
+        assert_eq!(classify(Some("removing"), true, None, true), ServerState::Wedged);
+        assert_eq!(classify(Some("dead"), false, None, false), ServerState::Wedged);
+        assert_eq!(classify(Some("paused"), true, Some("healthy"), true), ServerState::Wedged);
+    }
+
+    #[test]
+    fn classify_unknown_status_falls_through_to_old_behavior() {
+        // Any status that isn't one of the wedge values must not change
+        // the pre-existing classification logic at all.
+        assert_eq!(classify(Some("running"), true, Some("healthy"), true), ServerState::Up);
+        assert_eq!(classify(Some("restarting"), false, None, false), ServerState::Down);
+        assert_eq!(classify(Some("created"), false, None, false), ServerState::Down);
+        assert_eq!(classify(None, true, Some("starting"), false), ServerState::Starting);
     }
 
     #[test]
@@ -512,6 +657,96 @@ mod tests {
         let sig2 = d.observe(ServerState::Up, t0 + Duration::from_secs(30));
         assert_eq!(sig2.transition, None);
         assert!(!sig2.instability);
+    }
+
+    #[test]
+    fn no_escalation_while_up() {
+        let mut d = Damper::new(ServerState::Up);
+        let t0 = Instant::now();
+        for i in 0..20u64 {
+            let sig = d.observe(ServerState::Up, t0 + Duration::from_secs(i * 600));
+            assert_eq!(sig.escalation, None, "Up must never escalate, tick {i}");
+        }
+    }
+
+    #[test]
+    fn escalates_after_five_minutes_down() {
+        let mut d = Damper::new(ServerState::Up);
+        let t0 = Instant::now();
+        // Confirm the transition to Down (two consecutive readings).
+        assert_eq!(d.observe(ServerState::Down, t0).transition, None);
+        let confirmed = d.observe(ServerState::Down, t0 + Duration::from_secs(30));
+        assert_eq!(confirmed.transition, Some(ServerState::Down));
+        assert_eq!(confirmed.escalation, None, "no escalation on the transition tick itself");
+
+        let just_under = t0 + Duration::from_secs(30) + Duration::from_secs(299);
+        assert_eq!(d.observe(ServerState::Down, just_under).escalation, None);
+
+        let at_five_minutes = t0 + Duration::from_secs(30) + Duration::from_secs(300);
+        let sig = d.observe(ServerState::Down, at_five_minutes);
+        assert_eq!(
+            sig.escalation,
+            Some(Escalation { state: ServerState::Down, elapsed: Duration::from_secs(300) })
+        );
+    }
+
+    #[test]
+    fn escalation_ladder_backs_off_5_15_30_60_then_hourly() {
+        let mut d = Damper::new(ServerState::Down);
+        let t0 = Instant::now();
+        // Damper starts already-Down (as monitor::run constructs it);
+        // this first observe seeds state_since at t0.
+        assert_eq!(d.observe(ServerState::Down, t0).transition, None);
+
+        let ladder_minutes = [5u64, 15, 30, 60, 120, 180, 240];
+        for m in ladder_minutes {
+            let sig = d.observe(ServerState::Down, t0 + Duration::from_secs(m * 60));
+            assert_eq!(
+                sig.escalation.map(|e| e.elapsed),
+                Some(Duration::from_secs(m * 60)),
+                "expected an escalation exactly at minute {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn escalation_counter_resets_after_recovery() {
+        let mut d = Damper::new(ServerState::Up);
+        let t0 = Instant::now();
+        d.observe(ServerState::Down, t0);
+        d.observe(ServerState::Down, t0 + Duration::from_secs(30));
+        let sig = d.observe(ServerState::Down, t0 + Duration::from_secs(330));
+        assert!(sig.escalation.is_some(), "first rung should have fired");
+
+        // Recover: two confirmed Up readings clear escalations_sent.
+        d.observe(ServerState::Up, t0 + Duration::from_secs(400));
+        let recovered = d.observe(ServerState::Up, t0 + Duration::from_secs(430));
+        assert_eq!(recovered.transition, Some(ServerState::Up));
+
+        // Go down again: the ladder must restart at 5 minutes from THIS
+        // transition, not continue from wherever the old counter left off.
+        let t1 = t0 + Duration::from_secs(1000);
+        d.observe(ServerState::Down, t1);
+        let confirmed = d.observe(ServerState::Down, t1 + Duration::from_secs(30));
+        assert_eq!(confirmed.transition, Some(ServerState::Down));
+
+        let just_under = t1 + Duration::from_secs(30) + Duration::from_secs(299);
+        assert_eq!(d.observe(ServerState::Down, just_under).escalation, None);
+
+        let at_five_minutes = t1 + Duration::from_secs(30) + Duration::from_secs(300);
+        assert!(d.observe(ServerState::Down, at_five_minutes).escalation.is_some());
+    }
+
+    #[test]
+    fn wedged_and_down_both_escalate() {
+        let mut d = Damper::new(ServerState::Wedged);
+        let t0 = Instant::now();
+        d.observe(ServerState::Wedged, t0); // seeds state_since
+        let sig = d.observe(ServerState::Wedged, t0 + Duration::from_secs(300));
+        assert_eq!(
+            sig.escalation,
+            Some(Escalation { state: ServerState::Wedged, elapsed: Duration::from_secs(300) })
+        );
     }
 
     #[test]

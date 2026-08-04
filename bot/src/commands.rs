@@ -1,10 +1,11 @@
 use crate::config::Config;
-use crate::docker::{DockerCtl, StartOutcome};
+use crate::docker::{self, DockerCtl, StartOutcome};
 use crate::fortuna;
 use crate::parse;
 use crate::rcon::McRcon;
 use poise::serenity_prelude::RoleId;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 pub struct Data {
@@ -87,6 +88,36 @@ async fn is_remover(ctx: Ctx<'_>) -> Result<bool, Error> {
     Ok(ok)
 }
 
+/// Renders the "not running" branch of `/status` (and the lifecycle
+/// commands' honest-outcome replies): a wedged container must never again
+/// read like a clean stop. Pure and unit-testable without a running server.
+fn state_line(status: Option<&str>, exit_code: Option<i64>) -> String {
+    if docker::is_wedged(status) {
+        return wedge_explanation(status);
+    }
+    match status {
+        Some("exited") => {
+            let code = exit_code.unwrap_or(0);
+            format!("Yace dormida la ínsula, detenida en buen orden (código de salida {code}). Ni un alma en sus dominios.")
+        }
+        Some(s) => format!("Yace la ínsula en estado '{s}', vuestra merced. Ni un alma en sus dominios."),
+        None => "Yace dormida la ínsula, vuestra merced. Ni un alma en sus dominios.".to_string(),
+    }
+}
+
+/// Shared Quijote-voiced explanation of a wedged container: podman's own
+/// state, the fact that neither `/start` nor `/restart` can fix it, and
+/// that the host watchdog will rebuild it on its own within minutes.
+fn wedge_explanation(status: Option<&str>) -> String {
+    format!(
+        "Trabada yace la ínsula (podman la reporta en el estado '{}'), no por reposo sino por un mal \
+         encantamiento en sus entrañas. Ni /start ni /restart pueden ya desatarla: el vigía del \
+         castillo (host) la reconstruirá por su propia mano en pocos minutos, sin que nadie lo mande. \
+         Paciencia, vuestra merced; si tarda en exceso, consulte el RUNBOOK.",
+        status.unwrap_or("desconocido")
+    )
+}
+
 /// Da cuenta del estado de la ínsula: hidalgos presentes, TPS, tiempo en pie y memoria.
 #[poise::command(slash_command)]
 pub async fn status(ctx: Ctx<'_>) -> Result<(), Error> {
@@ -95,9 +126,13 @@ pub async fn status(ctx: Ctx<'_>) -> Result<(), Error> {
     let mc = d.docker.inspect("mc").await.ok().flatten();
     let running = mc.as_ref().map(|s| s.running).unwrap_or(false);
     if !running {
+        let status = mc.as_ref().and_then(|s| s.status.as_deref());
+        let exit_code = mc.as_ref().and_then(|s| s.exit_code);
+        let icon = if docker::is_wedged(status) { ":skull:" } else { ":red_circle:" };
         ctx.say(format!(
-            "Yace dormida la ínsula de **{}**, vuestra merced. Ni un alma en sus dominios.",
-            d.cfg.server_address
+            "{icon} **{}**\n{}",
+            d.cfg.server_address,
+            state_line(status, exit_code)
         ))
         .await?;
         return Ok(());
@@ -150,14 +185,39 @@ pub async fn start(ctx: Ctx<'_>) -> Result<(), Error> {
         return Ok(());
     }
     ctx.defer().await?;
-    match ctx.data().docker.start("mc").await? {
-        StartOutcome::Started => {
-            ctx.say("¡Ensillad a Rocinante! La ínsula despierta de su letargo.").await?
-        }
+    let d = ctx.data();
+
+    // Never fire /start blind: a wedged container answers podman's own
+    // "must be in Created or Stopped state" 500 either way, and a bare
+    // "start failed" would be exactly the lie the incident was about. Tell
+    // the truth up front and don't even try.
+    let pre = d.docker.inspect("mc").await?;
+    let pre_status = pre.as_ref().and_then(|s| s.status.as_deref());
+    if docker::is_wedged(pre_status) {
+        ctx.say(wedge_explanation(pre_status)).await?;
+        return Ok(());
+    }
+
+    match d.docker.start("mc").await? {
         StartOutcome::AlreadyRunning => {
-            ctx.say("Ya galopa la ínsula, vuestra merced; no ha menester espuelas.").await?
+            ctx.say("Ya galopa la ínsula, vuestra merced; no ha menester espuelas.").await?;
+            return Ok(());
         }
+        StartOutcome::Started => {}
+    }
+
+    // Report what actually happened, not just that the call returned Ok.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let post = d.docker.inspect("mc").await.ok().flatten();
+    let msg = match post {
+        Some(s) if s.running => "¡Ensillad a Rocinante! La ínsula despierta de su letargo.".to_string(),
+        Some(s) => format!(
+            "Se libró la orden de despertar, mas la ínsula aún no galopa (estado '{}'). Aguarde vuestra merced unos instantes y consulte /status.",
+            s.status.as_deref().unwrap_or("desconocido")
+        ),
+        None => "Se libró la orden de despertar, mas ya no hallo rastro de la ínsula; acuda vuestra merced al castillo (host).".to_string(),
     };
+    ctx.say(msg).await?;
     Ok(())
 }
 
@@ -167,8 +227,43 @@ pub async fn stop(ctx: Ctx<'_>) -> Result<(), Error> {
         return Ok(());
     }
     ctx.defer().await?;
-    ctx.data().docker.stop("mc").await?;
-    ctx.say("La ínsula reposa por mandato vuestro. Dormirá hasta que un /start la despierte.").await?;
+    let d = ctx.data();
+    d.docker.stop("mc").await?;
+
+    // podman can answer 204 to a stop that changes nothing on a wedged
+    // container (verified in the incident: 12:37:17, no-op 204). Poll for
+    // the real outcome instead of reporting success unconditionally.
+    let deadline = Instant::now() + Duration::from_secs(150);
+    let final_status = loop {
+        let s = d.docker.inspect("mc").await.ok().flatten().and_then(|s| s.status);
+        if s.as_deref() == Some("exited") || Instant::now() >= deadline {
+            break s;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    };
+
+    match final_status.as_deref() {
+        Some("exited") => {
+            ctx.say("La ínsula reposa por mandato vuestro. Dormirá hasta que un /start la despierte.").await?;
+        }
+        Some(s) if docker::is_wedged(Some(s)) => {
+            ctx.say(format!(
+                "El mandato de reposo se libró, mas la ínsula ha quedado TRABADA en el estado '{s}' en vez de \
+                 dormir en paz. El vigía del castillo (host) la reconstruirá en pocos minutos y VOLVERÁ A \
+                 LEVANTARSE por su propia mano — si vuestra merced desea que repose de veras, deberá librar \
+                 /stop de nuevo una vez se alce."
+            ))
+            .await?;
+        }
+        other => {
+            ctx.say(format!(
+                "El mandato de reposo se libró, mas tras dos minutos y medio la ínsula aún no confirma su \
+                 descanso (estado '{}'). Consulte vuestra merced /status.",
+                other.unwrap_or("desconocido")
+            ))
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -178,8 +273,17 @@ pub async fn restart(ctx: Ctx<'_>) -> Result<(), Error> {
         return Ok(());
     }
     ctx.defer().await?;
-    ctx.data().docker.restart("mc").await?;
-    ctx.say("Recomienza la justa: la ínsula se reinicia.").await?;
+    let d = ctx.data();
+
+    let pre = d.docker.inspect("mc").await?;
+    let pre_status = pre.as_ref().and_then(|s| s.status.as_deref());
+    if docker::is_wedged(pre_status) {
+        ctx.say(wedge_explanation(pre_status)).await?;
+        return Ok(());
+    }
+
+    d.docker.restart_via_stop_start("mc").await?;
+    ctx.say("Recomienza la justa: la ínsula se detuvo y se alzó de nuevo en buen orden.").await?;
     Ok(())
 }
 
@@ -489,6 +593,26 @@ pub async fn fortuna(
 #[cfg(test)]
 mod tests {
     use super::quixotify_whitelist;
+
+    #[test]
+    fn state_line_distinguishes_stopped_from_wedged() {
+        use super::state_line;
+
+        let stopped = state_line(Some("exited"), Some(0));
+        assert!(stopped.contains("dormida"), "{stopped}");
+        assert!(!stopped.contains("TRABADA") && !stopped.contains("Trabada"), "{stopped}");
+
+        for wedged_status in ["stopping", "removing", "dead", "paused"] {
+            let wedged = state_line(Some(wedged_status), None);
+            assert!(wedged.contains("Trabada"), "{wedged}");
+            assert!(wedged.contains(wedged_status), "podman's own state should be named: {wedged}");
+            assert!(!wedged.contains("dormida"), "wedge must not read as a clean stop: {wedged}");
+            assert!(wedged.contains("/start") && wedged.contains("/restart"));
+        }
+
+        let unknown = state_line(None, None);
+        assert!(unknown.contains("dormida"), "{unknown}");
+    }
 
     #[test]
     fn pauper_proclamations_name_the_pauper_and_vary() {

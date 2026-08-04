@@ -1,5 +1,6 @@
 use anyhow::{bail, Context as _};
 use bollard::Docker;
+use std::time::{Duration, Instant};
 
 pub const ALLOWED: [&str; 2] = ["mc", "mc-backup"];
 
@@ -23,11 +24,51 @@ pub struct ContainerStatus {
     pub health: Option<String>,
     pub started_at: Option<String>,
     pub exit_code: Option<i64>,
+    /// Raw `State.Status` from podman's docker-compat inspect: "created",
+    /// "running", "paused", "restarting", "removing", "exited", "dead", or
+    /// podman 4.9's "stopping" (a libpod-only value the upstream docker API
+    /// never emits, but which podman's compat handler passes through
+    /// verbatim — see `is_wedged`). This is the one field that lets the
+    /// bot tell a deliberate stop from a container wedged mid-lifecycle.
+    pub status: Option<String>,
+}
+
+/// Statuses podman's docker-compat inspect can report for a container that
+/// is stuck mid-lifecycle rather than cleanly stopped or running: podman
+/// 4.9.3 pins a decapitated container (conmon dead, no exit file) in
+/// "stopping" forever, and "removing"/"dead"/"paused" are the other states
+/// from which neither `/start` nor `/restart` can recover the container —
+/// only a host-side `podman rm -f` + recreate can.
+pub fn is_wedged(status: Option<&str>) -> bool {
+    matches!(status, Some("stopping") | Some("removing") | Some("dead") | Some("paused"))
+}
+
+/// Renders a bollard error for a human, keeping podman's own explanation
+/// instead of discarding it. `DockerResponseServerError` is podman's own
+/// compat-API response body (e.g. "container ... must be in Created or
+/// Stopped state to be started: container state improper"); everything
+/// else falls back to the error's own Display. Pure and unit-testable
+/// without a running server.
+fn describe(op: &str, e: &bollard::errors::Error) -> String {
+    match e {
+        bollard::errors::Error::DockerResponseServerError { status_code, message } => {
+            format!("{op} failed (HTTP {status_code}): {message}")
+        }
+        other => format!("{op} failed: {other}"),
+    }
 }
 
 #[derive(Clone)]
 pub struct DockerCtl {
     docker: Docker,
+    /// Second handle, identical to `docker` except for a 180s read/write
+    /// timeout instead of 30s. `stop`/`restart_via_stop_start` are the
+    /// only callers: a `--stop-timeout 120` container can legitimately
+    /// take just under two minutes to answer a stop, and the 30s handle
+    /// would report failure while the stop was still proceeding. Scoped
+    /// deliberately narrow — if a hung socket-proxy ever stalls this
+    /// handle, only lifecycle commands stall, not the 30s monitor loop.
+    slow: Docker,
 }
 
 impl DockerCtl {
@@ -39,7 +80,9 @@ impl DockerCtl {
             .negotiate_version()
             .await
             .context("API version negotiation against socket-proxy failed")?;
-        Ok(Self { docker })
+        let slow = Docker::connect_with_http(url, 180, &docker.client_version())
+            .context("bad DOCKER_API_URL (slow handle)")?;
+        Ok(Self { docker, slow })
     }
 
     pub async fn start(&self, name: &str) -> anyhow::Result<StartOutcome> {
@@ -49,18 +92,55 @@ impl DockerCtl {
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 304, ..
             }) => Ok(StartOutcome::AlreadyRunning),
-            Err(e) => Err(e).context("start failed"),
+            Err(e) => Err(anyhow::anyhow!(describe("start", &e))),
         }
     }
 
+    /// Stops the container on the 180s handle. A `stopping` result after
+    /// this returns Ok is a real possibility (podman 4.9's absorbing
+    /// state on a decapitated container) — callers that care about the
+    /// distinction must poll `inspect` afterward; this method only
+    /// reports whether the stop *request* succeeded.
     pub async fn stop(&self, name: &str) -> anyhow::Result<()> {
         guard(name)?;
-        self.docker.stop_container(name, None).await.context("stop failed")
+        self.slow
+            .stop_container(name, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(describe("stop", &e)))
     }
 
-    pub async fn restart(&self, name: &str) -> anyhow::Result<()> {
+    /// Restarts by stopping and waiting for the container to actually
+    /// settle into `exited`/`created` before starting it again, instead of
+    /// calling podman's compat `/restart` endpoint. That endpoint is the
+    /// primitive stage 2 of the wedge incident rode in on: `restartWithTimeout`
+    /// only re-inits from a settled state, so restarting a container that
+    /// hasn't finished stopping calls `crun start` on a half-torn-down
+    /// payload and wedges it. Bails with the observed status (never blindly
+    /// starts on top of an unsettled state) if it does not settle within
+    /// 150s.
+    pub async fn restart_via_stop_start(&self, name: &str) -> anyhow::Result<()> {
         guard(name)?;
-        self.docker.restart_container(name, None).await.context("restart failed")
+        self.slow
+            .stop_container(name, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(describe("restart", &e)))?;
+
+        let deadline = Instant::now() + Duration::from_secs(150);
+        loop {
+            let status = self.inspect(name).await?.and_then(|s| s.status);
+            if matches!(status.as_deref(), Some("exited") | Some("created")) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "restart failed: container did not settle within 150s after stop (status: {})",
+                    status.as_deref().unwrap_or("unknown")
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        self.start(name).await.map(|_| ())
     }
 
     pub async fn inspect(&self, name: &str) -> anyhow::Result<Option<ContainerStatus>> {
@@ -73,12 +153,13 @@ impl DockerCtl {
                     health: state.health.and_then(|h| h.status).map(|s| s.to_string()),
                     started_at: state.started_at,
                     exit_code: state.exit_code,
+                    status: state.status.map(|s| s.to_string()),
                 }))
             }
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => Ok(None),
-            Err(e) => Err(e).context("inspect failed"),
+            Err(e) => Err(anyhow::anyhow!(describe("inspect", &e))),
         }
     }
 
@@ -131,5 +212,43 @@ mod tests {
         assert!(guard("bot").is_err());
         assert!(guard("socket-proxy").is_err());
         assert!(guard("mc; rm -rf /").is_err());
+    }
+
+    #[test]
+    fn is_wedged_covers_stopping_removing_dead_paused() {
+        for s in ["stopping", "removing", "dead", "paused"] {
+            assert!(is_wedged(Some(s)), "{s} should be wedged");
+        }
+        for s in ["running", "exited", "created", "restarting"] {
+            assert!(!is_wedged(Some(s)), "{s} should not be wedged");
+        }
+        assert!(!is_wedged(None));
+    }
+
+    #[test]
+    fn describe_keeps_podman_message() {
+        let e = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "container ... must be in Created or Stopped state to be started: container state improper".to_string(),
+        };
+        let out = describe("start", &e);
+        assert!(
+            out.contains(
+                "container ... must be in Created or Stopped state to be started: container state improper"
+            ),
+            "podman's message was dropped: {out}"
+        );
+        assert!(out.contains("500"), "status code was dropped: {out}");
+    }
+
+    #[test]
+    fn describe_labels_the_operation() {
+        let e = bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: "conflict".to_string(),
+        };
+        assert!(describe("stop", &e).starts_with("stop failed"));
+        assert!(describe("restart", &e).starts_with("restart failed"));
+        assert!(describe("start", &e).starts_with("start failed"));
     }
 }

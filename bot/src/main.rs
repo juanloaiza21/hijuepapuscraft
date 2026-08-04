@@ -16,6 +16,49 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 
+/// Custom `on_error` for the framework. Replaces poise's default, which
+/// does a bare `error.to_string()` — that's exactly why "start failed"
+/// with no cause was the only trace left by three failed lifecycle
+/// commands in the 60 seconds before the wedge incident went silent.
+/// `{error:#}` walks the anyhow chain so podman's own message (surfaced by
+/// `docker::describe`) reaches the admin. `/start`, `/stop` and `/restart`
+/// failures also get a copy posted to the notify channel with an admin
+/// ping, so a failed lifecycle command is an escalation signal instead of
+/// something only the caller who typed it ever sees.
+fn on_error(error: poise::FrameworkError<'_, Data, commands::Error>) -> poise::BoxFuture<'_, ()> {
+    Box::pin(async move {
+        if let poise::FrameworkError::Command { error, ctx, .. } = &error {
+            let full = format!("{error:#}");
+            let command_name = ctx.command().name.clone();
+            tracing::error!("comando /{command_name} fracasó: {full}");
+
+            if let Err(e) = ctx.say(full.clone()).await {
+                tracing::warn!("failed to reply with command error: {e:#}");
+            }
+
+            if matches!(command_name.as_str(), "start" | "stop" | "restart") {
+                let cfg = &ctx.data().cfg;
+                let channel = serenity::ChannelId::new(cfg.notify_channel_id);
+                let content = format!(
+                    "<@&{}> :rotating_light: **/{command_name}** ha fracasado: {full}",
+                    cfg.admin_role_id
+                );
+                let reply = serenity::CreateMessage::new().content(content).allowed_mentions(
+                    serenity::CreateAllowedMentions::new()
+                        .roles(vec![serenity::RoleId::new(cfg.admin_role_id)]),
+                );
+                if let Err(e) = channel.send_message(ctx.http(), reply).await {
+                    tracing::warn!("failed to post lifecycle failure to notify channel: {e:#}");
+                }
+            }
+            return;
+        }
+        if let Err(e) = poise::builtins::on_error(error).await {
+            tracing::error!("Error while handling error: {e}");
+        }
+    })
+}
+
 /// Directory holding the "last announced build" marker file. Overridable
 /// via `BOT_STATE_DIR` (tests use a tempdir); defaults to `/data`, backed
 /// in production by the `bot-state` podman volume (see
@@ -130,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: commands::commands(),
+            on_error,
             ..Default::default()
         })
         .setup(move |ctx, _ready, framework| {
