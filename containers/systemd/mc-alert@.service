@@ -1,0 +1,6 @@
+[Unit]
+Description=Alert that %i failed
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hijuepapuscraft/scripts/mc-alert.sh ":rotating_light: unit %i failed on the host -- journalctl -u %i"

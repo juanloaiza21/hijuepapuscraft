@@ -2,12 +2,35 @@
 Description=Start Minecraft container at boot
 Wants=network-online.target mcnet-network.service podman.socket
 After=network-online.target mcnet-network.service podman.socket
+OnFailure=mc-alert@%n.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# KillMode=process: see scripts/lib-mc.sh for the full rationale. This
+# unit does not source that library (it must work standalone at boot,
+# before the repo checkout is guaranteed ready), so the same reasoning is
+# inlined here: a unit's cgroup teardown can SIGKILL a live conmon, and
+# this is the unit that has already done so once in production
+# (Aug 01 22:11:20, "Killing process 21266 (conmon)").
+KillMode=process
+TimeoutStopSec=180
 # Retry: boot can race image/network readiness.
-ExecStart=/bin/sh -c 'for i in 1 2 3 4 5; do podman start mc && exit 0; sleep 10; done; exit 1'
+# env -u INVOCATION_ID: podman 4.9.3 skips moving a freshly spawned conmon
+# into its own libpod-conmon-<id>.scope when $INVOCATION_ID is set (i.e.
+# when run inside a systemd unit), which otherwise lets the KillMode above
+# reach a conmon it should never touch. Without this, `podman start` from
+# this unit is the same landmine as the daily restart. This is the first,
+# independent half of the fix -- do not remove it believing KillMode
+# alone covers it.
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5; do env -u INVOCATION_ID podman start mc && exit 0; sleep 10; done; exit 1'
+# `podman stop` does not spawn a new conmon (it signals the existing one
+# and waits for it to write the exit file), so it is not subject to the
+# INVOCATION_ID placement bug above. Giving this unit an ExecStop at all
+# is still required: today `systemctl stop mc.service` has none, so
+# systemd's cgroup kill IS the stop action and the --stop-timeout 120 that
+# mc-recreate.sh sets to protect a mid-save JVM is bypassed entirely.
+ExecStop=/usr/bin/podman stop -t 120 mc
 
 [Install]
 WantedBy=multi-user.target

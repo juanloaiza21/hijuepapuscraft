@@ -1,0 +1,14 @@
+[Unit]
+Description=Watchdog for the mc container (orphaned conmon / wedged state)
+OnFailure=mc-alert@%n.service
+
+[Service]
+Type=oneshot
+# KillMode=process: same reasoning as mc-restart.service -- the watchdog
+# itself starts containers (repair_recreate, stop_start_verified in
+# scripts/lib-mc.sh), so it must not be able to decapitate the conmon of
+# the container it just repaired.
+KillMode=process
+TimeoutStartSec=1200
+TimeoutStopSec=180
+ExecStart=/opt/hijuepapuscraft/scripts/mc-watchdog.sh

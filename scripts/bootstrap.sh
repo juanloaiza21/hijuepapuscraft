@@ -90,7 +90,7 @@ EOF
 
   log "packages: podman, firewall persistence, fail2ban, unattended-upgrades, git"
   ensure_pkg podman iptables-persistent netfilter-persistent fail2ban \
-    unattended-upgrades git curl ca-certificates
+    unattended-upgrades git curl ca-certificates jq
   systemctl enable --now podman.socket
 
   log "firewall phase 1: open 25565 in INPUT and FORWARD, persist"
@@ -144,7 +144,7 @@ EOF
   done
   systemctl daemon-reload
   systemctl enable mc.service
-  systemctl enable --now mc-backup.timer mc-restart.timer \
+  systemctl enable --now mc-backup.timer mc-restart.timer mc-watchdog.timer \
     restic-forget.timer restic-check.timer
 
   log "phase 1 done. Next steps (see README first run walkthrough for full detail):"

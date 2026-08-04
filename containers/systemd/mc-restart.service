@@ -1,6 +1,18 @@
 [Unit]
 Description=Daily server restart with in-game warnings
+OnFailure=mc-alert@%n.service
 
 [Service]
 Type=oneshot
+# KillMode=process: this unit's own cgroup teardown SIGKILLed a live
+# conmon 90s after ExecStart returned (verified in the incident journal),
+# because podman leaves conmon inside the unit's cgroup when it detects
+# $INVOCATION_ID (see scripts/lib-mc.sh). KillMode=process makes the stop
+# phase target only the (already-exited) script, not conmon. This is the
+# second, independent half of the fix -- restart-warn.sh's `env -u
+# INVOCATION_ID` wrapper is the first half. Do not remove either on its
+# own believing the other covers it.
+KillMode=process
+TimeoutStopSec=180
+TimeoutStartSec=1800
 ExecStart=/opt/hijuepapuscraft/scripts/restart-warn.sh

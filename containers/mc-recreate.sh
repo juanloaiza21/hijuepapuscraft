@@ -51,4 +51,4 @@ podman create \
   --health-start-period 300s \
   "${MC_IMAGE}"
 
-echo "created. start with: systemctl start mc.service (or podman start mc)"
+echo "created. start with: systemctl restart mc.service   (NOT 'start': the unit is Type=oneshot/RemainAfterExit=yes and already active, so 'start' is a silent no-op)"

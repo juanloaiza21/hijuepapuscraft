@@ -1,6 +1,12 @@
 [Unit]
 Description=Nightly world backup (runs attached so failures are visible)
+OnFailure=mc-alert@%n.service
 
 [Service]
 Type=oneshot
+# KillMode=process: same hazard class as mc-restart.service/mc.service --
+# a `systemctl stop mc-backup.service` mid-run would otherwise let this
+# unit's cgroup teardown SIGKILL the backup container's conmon. See
+# scripts/lib-mc.sh for the full rationale.
+KillMode=process
 ExecStart=/usr/bin/podman start -a mc-backup
