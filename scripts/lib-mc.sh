@@ -164,7 +164,9 @@ repair_recreate() {
   fi
   repair_budget_record
   alert ":wrench: repairing $MC_CONTAINER ($reason): rm -f + recreate"
-  if ! timeout 180 pod rm -f "$MC_CONTAINER"; then
+  # `timeout` execs a binary, so it cannot run the pod() shell function;
+  # inline the wrapper here instead (found by the recovery drill).
+  if ! timeout 180 env -u INVOCATION_ID podman rm -f "$MC_CONTAINER"; then
     alert ":rotating_light: repair of $MC_CONTAINER failed: rm -f did not complete within 180s"
     return 1
   fi
