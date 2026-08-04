@@ -40,10 +40,10 @@ cd pack && packwiz remove <mod>
 packwiz refresh
 git add pack && git commit -m "..."
 git push
-podman restart mc
+sudo systemctl restart mc.service
 ```
 
-`packwiz refresh` keeps `pack/index.toml`'s hashes in sync with the mod files, so it has to run before committing. The `mc` container refetches the pack from `PACKWIZ_URL` on start, so `podman restart mc` is enough to apply the change; there is no need to run `containers/mc-recreate.sh` for a mod-only change.
+`packwiz refresh` keeps `pack/index.toml`'s hashes in sync with the mod files, so it has to run before committing. The `mc` container refetches the pack from `PACKWIZ_URL` on start with `systemctl restart mc.service`, which now stops it through podman with the full 120-second stop timeout; there is no need to run `containers/mc-recreate.sh` for a mod-only change.
 
 ## Re-adding C2ME
 
@@ -62,7 +62,7 @@ cd pack && packwiz remove c2me-fabric
 packwiz refresh
 git add pack && git commit -m "Remove c2me-fabric: crash-looping"
 git push
-podman restart mc
+sudo systemctl restart mc.service
 ```
 
 ## Rollback
@@ -72,7 +72,7 @@ If a pack change breaks the server and the specific mod is not obvious, roll bac
 ```bash
 git revert <pack-commit-sha>
 git push
-podman restart mc
+sudo systemctl restart mc.service
 ```
 
 ## Datapacks

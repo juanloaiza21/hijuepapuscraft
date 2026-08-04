@@ -130,7 +130,7 @@ Run in order on a fresh host, after the Oracle console, Cloudflare R2, Hostinger
     ```bash
     sudo podman exec mc sed -i 's/premium-auto-login.*/premium-auto-login = true/' /data/config/EasyAuth/main.conf
     sudo podman exec mc sed -i 's/prevent-offline-players-with-online-usernames.*/prevent-offline-players-with-online-usernames = true/' /data/config/EasyAuth/main.conf
-    sudo podman restart mc
+    sudo systemctl restart mc.service
     ```
 12. Test EasyAuth mixed mode empirically: connect with one premium client and one cracked client, confirm both authenticate correctly. If it misbehaves, the documented fallback is changing `ONLINE_MODE=TRUE` to `ONLINE_MODE=FALSE` in `containers/mc-recreate.sh` (everyone password-auths via EasyAuth, `ONLINE_MODE` is hardcoded there, not read from `.env`), then re-running `sudo containers/mc-recreate.sh`.
 13. Pre-generate the world before inviting friends:

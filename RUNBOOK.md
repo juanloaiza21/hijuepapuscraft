@@ -15,9 +15,50 @@ podman logs --tail 100 mc
 
 **Fix, by cause:**
 
-- Bad `.env` (missing or malformed `MEMORY`, `RCON_PASSWORD`, `DIFFICULTY`, or an image tag). Fix the value in `/opt/hijuepapuscraft/.env`, then `containers/mc-recreate.sh` and `systemctl start mc.service`.
+- Bad `.env` (missing or malformed `MEMORY`, `RCON_PASSWORD`, `DIFFICULTY`, or an image tag). Fix the value in `/opt/hijuepapuscraft/.env`, then `containers/mc-recreate.sh` and `systemctl restart mc.service`.
 - `PACKWIZ_URL` unreachable (repo went private, GitHub outage, or the pack file moved). The logs show a failed pack fetch. Confirm `curl https://raw.githubusercontent.com/juanloaiza21/hijuepapuscraft/main/pack/pack.toml` returns content.
 - EULA not accepted: `containers/mc-recreate.sh` sets `EULA=TRUE` unconditionally, so this only happens after a hand-edited container definition. Confirm with `podman inspect mc`.
+
+## Container wedged in stopping / running with a dead conmon
+
+**Symptoms:** `podman inspect mc` shows `State.Status=stopping` with a pid and exitcode 0 and no OOM; or `Status=running` while the recorded ConmonPid is dead. The bot says "trabada" or "Yace dormida". `/start` replies with podman's "must be in Created or Stopped state". `/stop` reports success but changes nothing. `journalctl -u mc-restart.service` shows `container restart` then `container stop` with no `died` line.
+
+**Diagnosis:**
+
+```bash
+podman inspect mc --format '{{.State.Status}} conmon={{.State.ConmonPid}}'
+kill -0 <conmonpid>
+cat /proc/<conmonpid>/cgroup
+```
+
+The cgroup output must contain `libpod-conmon-`. If the conmon process is dead, this is the wedged-with-orphan case.
+
+**Expected recovery:** `mc-watchdog.timer` detects this within 5-10 minutes, repairs the container automatically, and posts alerts to Discord at both ends.
+
+**Manual repair, simple (destroys the container object):**
+
+```bash
+podman rm -f mc
+containers/mc-recreate.sh
+podman start mc
+```
+
+**Manual repair, advanced (preserves the container, skips re-init):** only if you need to keep the container object itself unchanged and cannot afford the 10-second re-init.
+
+```bash
+# Destroy the payload, forcing cleanup of the resource files.
+crun kill --all <container-id> KILL
+crun delete --force <container-id>
+
+# Write exit code 0 to the exit file so libpod's checkExitFile unblocks the state machine.
+# This is a bare integer with NO newline.
+printf 0 > /run/libpod/exits/<container-id>
+
+# Now podman can move the state to stopped and start again.
+podman start mc
+```
+
+**Note:** podman 5.1.0+ includes an upstream fix for this failure mode. Ubuntu 24.04 ships podman 4.9.3 and will not receive the fix.
 
 ## Port 25565 dead after reboot
 
@@ -92,7 +133,7 @@ podman run --rm -v mc-data-restore:/from:ro -v mc-data:/to docker.io/alpine:3.22
 systemctl restart mc.service
 ```
 
-Both recreate scripts have to run at the end. A pre-created container keeps its volume reference from creation time, so `mc` and `mc-backup` need to be rebuilt against the restored `mc-data` volume, not just started.
+Both recreate scripts have to run at the end. A pre-created container keeps its volume reference from creation time, so `mc` and `mc-backup` need to be rebuilt against the restored `mc-data` volume, not just started. Note: `mc.service` now has an `ExecStop` that gracefully stops the server with the full 120-second timeout, so the step `systemctl restart mc.service` waits for the server to exit before restarting.
 
 ## Oracle reclaimed or killed the instance
 
@@ -139,7 +180,7 @@ systemctl status bot.service
 podman logs bot
 ```
 
-**Fix:** the server itself is unaffected; `mc` runs independently of `bot`, so players stay online. Restart with `systemctl restart bot.service`. If it crash-loops, check `.env` for a stale `DISCORD_TOKEN` or an unreachable `DOCKER_API_URL`. `bot.service` reads the scoped `.env.bot`, not `.env` directly, so after fixing the value in `.env` run `scripts/gen-scoped-env.sh` (auto-generated, not hand-edited) before restarting the service.
+**Fix:** the server itself is unaffected; `mc` runs independently of `bot`, so players stay online. Restart with `systemctl restart bot.service`. If it crash-loops, check `.env` for a stale `DISCORD_TOKEN` or an unreachable `DOCKER_API_URL`. `bot.service` reads the scoped `.env.bot`, not `.env` directly, so after fixing the value in `.env` run `scripts/gen-scoped-env.sh` (auto-generated, not hand-edited) before restarting the service. Note: `mc.service` now has an `ExecStop` that gracefully stops the server with the full 120-second timeout, so `systemctl stop mc.service` really stops the server and does not return until it has exited or timed out.
 
 ## Cracked player bought the game
 

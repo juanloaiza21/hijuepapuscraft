@@ -1,0 +1,32 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: lint shell scripts
+        run: shellcheck -x scripts/*.sh containers/*.sh backup/*.sh
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test
+        working-directory: bot
+        run: cargo test --locked
+
+      - name: cargo clippy
+        working-directory: bot
+        run: cargo clippy --all-targets -- -D warnings
